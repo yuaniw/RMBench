@@ -29,3 +29,6 @@ envs/curobo/*
 
 /*.json*
 /*.txt
+**/training_data/
+*.out
+*.npy
