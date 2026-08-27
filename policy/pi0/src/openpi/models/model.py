@@ -23,6 +23,16 @@ logger = logging.getLogger("openpi")
 ArrayT = TypeVar("ArrayT", at.Array, jax.ShapeDtypeStruct)
 
 
+def _restore_omitted_none_leaves(expected: at.PyTree, params: at.PyTree) -> at.PyTree:
+    """Reinsert parameter leaves that Orbax omits when their value is None."""
+    expected_flat = traverse_util.flatten_dict(expected)
+    params_flat = traverse_util.flatten_dict(params)
+    for keypath, value in expected_flat.items():
+        if value is None and keypath not in params_flat:
+            params_flat[keypath] = None
+    return traverse_util.unflatten_dict(params_flat)
+
+
 class ModelType(enum.Enum):
     """Supported model types."""
 
@@ -228,6 +238,7 @@ class BaseModelConfig(abc.ABC):
         graphdef, state = nnx.split(model)
         if remove_extra_params:
             params = ocp.transform_utils.intersect_trees(state.to_pure_dict(), params)
+        params = _restore_omitted_none_leaves(state.to_pure_dict(), params)
         at.check_pytree_equality(expected=state.to_pure_dict(), got=params, check_shapes=True, check_dtypes=False)
         state.replace_by_pure_dict(params)
         return nnx.merge(graphdef, state)
@@ -254,6 +265,7 @@ class BaseModel(nnx.Module, abc.ABC):
     action_dim: int
     action_horizon: int
     max_token_len: int
+    history_conditioner = None
 
     @abc.abstractmethod
     def compute_loss(

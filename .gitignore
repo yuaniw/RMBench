@@ -31,4 +31,15 @@ envs/curobo/*
 /*.txt
 **/training_data/
 *.out
+*.err
+slurm_logs/
+policy/Diff-Control
+policy/CycleManip
+policy/MaIL
+policy/Mamba-policy
+policy/MTIL
+policy/DP
 *.npy
+*.ckpt
+*.log
+

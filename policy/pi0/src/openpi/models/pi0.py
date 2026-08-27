@@ -1,5 +1,6 @@
 import dataclasses
 import logging
+from typing import Literal
 
 import einops
 import flax.nnx as nnx
@@ -10,6 +11,7 @@ from typing_extensions import override
 
 from openpi.models import model as _model
 import openpi.models.gemma as _gemma
+import openpi.models.history as _history
 import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
@@ -73,6 +75,16 @@ class Pi0Config(_model.BaseModelConfig):
     action_dim: int = 32
     action_horizon: int = 50
     max_token_len: int = 48
+    history: _history.HistoryEncoderConfig | None = None
+    separate_history_image_encoder: bool = False
+    history_train_scope: Literal[
+        "history_action_lora",
+        "history_vlm_action_lora",
+        "history_vlm_action_lora_siglip",
+        "stage1_except_siglip",
+        "full_except_siglip",
+        "state_action_baseline",
+    ] = "history_action_lora"
 
     @property
     @override
@@ -110,6 +122,48 @@ class Pi0Config(_model.BaseModelConfig):
 
     def get_freeze_filter(self) -> nnx.filterlib.Filter:
         """Returns the freeze filter based on the model config."""
+        if self.history is not None:
+            if self.history_train_scope == "history_action_lora":
+                trainable = nnx.Any(
+                    nnx_utils.PathRegex(".*history_conditioner.*"),
+                    nnx_utils.PathRegex(".*history_modulation.*"),
+                    nnx_utils.PathRegex(".*history_token_proj.*"),
+                    nnx_utils.PathRegex(".*llm.*_1.*lora.*"),
+                )
+            elif self.history_train_scope == "history_vlm_action_lora":
+                trainable = nnx.Any(
+                    nnx_utils.PathRegex(".*history_conditioner.*"),
+                    nnx_utils.PathRegex(".*history_modulation.*"),
+                    nnx_utils.PathRegex(".*history_token_proj.*"),
+                    nnx_utils.PathRegex(".*llm.*lora.*"),
+                )
+            elif self.history_train_scope == "history_vlm_action_lora_siglip":
+                trainable = nnx.Any(
+                    nnx_utils.PathRegex(".*history_conditioner.*"),
+                    nnx_utils.PathRegex(".*history_modulation.*"),
+                    nnx_utils.PathRegex(".*history_token_proj.*"),
+                    nnx_utils.PathRegex(".*llm.*lora.*"),
+                    nnx_utils.PathRegex(".*PaliGemma/img.*"),
+                )
+            elif self.history_train_scope == "stage1_except_siglip":
+                trainable = nnx.Any(
+                    nnx_utils.PathRegex(".*history_conditioner.*"),
+                    nnx_utils.PathRegex(".*history_modulation.*"),
+                    nnx_utils.PathRegex(".*history_token_proj.*"),
+                    nnx_utils.PathRegex(".*llm.*lora.*"),
+                    nnx_utils.PathRegex(
+                        ".*(state_proj|action_in_proj|action_time_mlp_in|action_time_mlp_out|action_out_proj).*"
+                    ),
+                )
+            elif self.history_train_scope == "full_except_siglip":
+                return nnx_utils.PathRegex(".*PaliGemma/img.*")
+            elif self.history_train_scope == "state_action_baseline":
+                trainable = nnx_utils.PathRegex(
+                    ".*history_conditioner/(state_action_head|state_action_head_norm).*"
+                )
+            else:
+                raise ValueError(f"Unsupported history training scope: {self.history_train_scope}")
+            return nnx.Not(trainable)
         filters = []
         has_lora = False
         gemma_params_filter = nnx_utils.PathRegex(".*llm.*")
@@ -136,6 +190,8 @@ class Pi0(_model.BaseModel):
 
     def __init__(self, config: Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
+        if config.separate_history_image_encoder and config.history is None:
+            raise ValueError("A separate history image encoder requires history conditioning.")
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -155,31 +211,206 @@ class Pi0(_model.BaseModel):
             ))
         img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
+        self.history_image_encoder = None
+        if config.separate_history_image_encoder:
+            self.history_image_encoder = nnx_bridge.ToNNX(
+                _siglip.Module(
+                    num_classes=paligemma_config.width,
+                    variant="So400m/14",
+                    pool_type="none",
+                    scan=True,
+                    dtype_mm=config.dtype,
+                )
+            )
+            self.history_image_encoder.lazy_init(
+                next(iter(config.fake_obs().images.values())), train=False, rngs=rngs
+            )
         self.state_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
         self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
+        self.history_conditioner = None
+        self.history_modulation = None
+        self.history_token_proj = None
+        if config.history is not None:
+            self.history_conditioner = _history.HistoryConditioner(config.history, rngs=rngs)
+            if config.history.conditioning_mode == "film":
+                self.history_modulation = nnx.Linear(
+                    config.history.d_model,
+                    2 * action_expert_config.width,
+                    kernel_init=jax.nn.initializers.zeros,
+                    bias_init=jax.nn.initializers.zeros,
+                    rngs=rngs,
+                )
+            elif config.history.conditioning_mode == "prefix_tokens":
+                self.history_token_proj = nnx.Linear(
+                    config.history.d_model, action_expert_config.width, rngs=rngs
+                )
+            else:
+                self.history_token_proj = nnx.Linear(
+                    config.history.d_model, paligemma_config.width, rngs=rngs
+                )
+
+    def encode_history_images(self, images: jax.Array, *, pooled_grid_size: int = 4) -> jax.Array:
+        image_encoder = self.PaliGemma.img
+        if self.history_image_encoder is not None:
+            image_encoder = self.history_image_encoder
+        image_tokens, _ = image_encoder(images, train=False)
+        source_grid_size = int(image_tokens.shape[1]**0.5)
+        if source_grid_size**2 != image_tokens.shape[1]:
+            raise ValueError(f"Expected a square image-token grid, got {image_tokens.shape[1]} tokens.")
+        if source_grid_size % pooled_grid_size != 0:
+            raise ValueError(f"Cannot pool a {source_grid_size}x{source_grid_size} grid to {pooled_grid_size}x{pooled_grid_size}.")
+        cell_size = source_grid_size // pooled_grid_size
+        features = image_tokens.reshape(
+            images.shape[0], pooled_grid_size, cell_size, pooled_grid_size, cell_size, image_tokens.shape[-1]
+        )
+        features = jnp.mean(features, axis=(2, 4))
+        return features.reshape(images.shape[0], pooled_grid_size**2, image_tokens.shape[-1])
+
+    def encode_history_conditions(
+        self,
+        visual_features: jax.Array,
+        states: jax.Array,
+        valid_mask: jax.Array,
+        anchor_indices: jax.Array,
+        *,
+        train: bool = False,
+    ) -> jax.Array:
+        if self.history_conditioner is None:
+            raise ValueError("History conditioning is not enabled for this Pi0 model.")
+        conditions = self.history_conditioner.gather_anchor_conditions(
+            visual_features, states, valid_mask, anchor_indices, train=train
+        )
+        if self.history_conditioner.config.conditioning_mode == "film":
+            return conditions.reshape((-1, conditions.shape[-1]))
+        if self.history_conditioner.config.conditioning_mode == "single_token":
+            return conditions.reshape((-1, 1, conditions.shape[-1]))
+        return conditions.reshape((-1, conditions.shape[-2], conditions.shape[-1]))
+
+    def encode_single_token_history(
+        self,
+        visual_features: jax.Array,
+        states: jax.Array,
+        valid_mask: jax.Array,
+        anchor_indices: jax.Array,
+        use_previous: jax.Array,
+        *,
+        train: bool = False,
+    ) -> tuple[jax.Array, jax.Array]:
+        if self.history_conditioner is None:
+            raise ValueError("History conditioning is not enabled for this Pi0 model.")
+        if self.history_conditioner.config.conditioning_mode != "single_token":
+            raise ValueError("Single-token encoding requires single-token conditioning.")
+        sequence = self.history_conditioner.encode_sequence(
+            visual_features, states, valid_mask, train=train
+        )
+        conditions = self.history_conditioner.gather_single_token_conditions(
+            sequence, anchor_indices, use_previous
+        )
+        return conditions.reshape((-1, 1, conditions.shape[-1])), sequence
+
+    def predict_history_actions(self, encoded_sequence: jax.Array) -> jax.Array:
+        if self.history_conditioner is None:
+            raise ValueError("History conditioning is not enabled for this Pi0 model.")
+        return self.history_conditioner.predict_actions(encoded_sequence)
+
+    def predict_state_actions(self, states: jax.Array) -> jax.Array:
+        if self.history_conditioner is None:
+            raise ValueError("History conditioning is not enabled for this Pi0 model.")
+        return self.history_conditioner.predict_actions_from_states(states)
+
+    def init_history_cache(self, batch_size: int):
+        if self.history_conditioner is None:
+            raise ValueError("History conditioning is not enabled for this Pi0 model.")
+        return self.history_conditioner.init_cache(batch_size)
+
+    def history_film_diagnostics(self, history_condition: jax.Array) -> dict[str, jax.Array]:
+        if self.history_modulation is None:
+            raise ValueError("History conditioning is not enabled for this Pi0 model.")
+        modulation = self.history_modulation(history_condition)
+        zero_modulation = self.history_modulation(jnp.zeros_like(history_condition))
+        scale, shift = jnp.split(modulation, 2, axis=-1)
+        zero_scale, zero_shift = jnp.split(zero_modulation, 2, axis=-1)
+        return {
+            "history_condition": history_condition,
+            "scale": scale,
+            "shift": shift,
+            "scale_dynamic": scale - zero_scale,
+            "shift_dynamic": shift - zero_shift,
+        }
+
+    def history_prefix_diagnostics(self, history_condition: jax.Array) -> dict[str, jax.Array]:
+        if self.history_token_proj is None:
+            raise ValueError("History prefix diagnostics require prefix-token conditioning.")
+        tokens = self.history_token_proj(history_condition)
+        normalized = tokens / jnp.maximum(jnp.linalg.norm(tokens, axis=-1, keepdims=True), 1e-6)
+        cosine = jnp.einsum("bkd,bld->bkl", normalized, normalized)
+        token_count = tokens.shape[1]
+        off_diagonal = jnp.ones((tokens.shape[0],), dtype=tokens.dtype)
+        if token_count > 1:
+            off_diagonal = (jnp.sum(cosine, axis=(-2, -1)) - token_count) / (
+                token_count * (token_count - 1)
+            )
+        return {
+            "history_tokens": tokens,
+            "token_norms": jnp.linalg.norm(tokens, axis=-1),
+            "token_variance": jnp.mean(jnp.var(tokens, axis=1), axis=-1),
+            "token_pairwise_cosine": off_diagonal,
+        }
+
+    def update_history(
+        self,
+        observation: _model.Observation,
+        cache,
+    ):
+        if self.history_conditioner is None:
+            raise ValueError("History conditioning is not enabled for this Pi0 model.")
+        observation = _model.preprocess_observation(None, observation, train=False)
+        visual_features = self.encode_history_images(observation.images["base_0_rgb"])
+        valid = observation.image_masks["base_0_rgb"]
+        condition, cache = self.history_conditioner.step(visual_features, observation.state, valid, cache)
+        if self.history_conditioner.config.conditioning_mode == "single_token":
+            condition = condition[:, None, :]
+        return condition, cache
 
     @at.typecheck
     def embed_prefix(
-        self, obs: _model.Observation
+        self,
+        obs: _model.Observation,
+        history_condition: jax.Array | None = None,
+        current_image_visible: jax.Array | None = None,
     ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
         input_mask = []
         ar_mask = []
         tokens = []
+        if current_image_visible is None:
+            current_image_visible = jnp.ones(obs.state.shape[:-1], dtype=jnp.bool_)
         # embed images
         for name in obs.images:
             image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
 
             tokens.append(image_tokens)
             input_mask.append(einops.repeat(
-                obs.image_masks[name],
+                obs.image_masks[name] & current_image_visible,
                 "b -> b s",
                 s=image_tokens.shape[1],
             ))
             # image tokens attend to each other
             ar_mask += [False] * image_tokens.shape[1]
+
+        if history_condition is not None:
+            if self.history_conditioner is None or (
+                self.history_conditioner.config.conditioning_mode != "single_token"
+            ):
+                raise ValueError("VLM-prefix history requires single-token conditioning.")
+            if self.history_token_proj is None:
+                raise ValueError("Single-token history projection is not initialized.")
+            history_tokens = self.history_token_proj(history_condition)
+            tokens.append(history_tokens)
+            input_mask.append(jnp.ones(history_tokens.shape[:2], dtype=jnp.bool_))
+            ar_mask += [False] * history_tokens.shape[1]
 
         # add language (aka tokenized inputs)
         if obs.tokenized_prompt is not None:
@@ -195,7 +426,12 @@ class Pi0(_model.BaseModel):
 
     @at.typecheck
     def embed_suffix(
-        self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]
+        self,
+        obs: _model.Observation,
+        noisy_actions: _model.Actions,
+        timestep: at.Float[at.Array, " b"],
+        history_condition: jax.Array | None = None,
+        current_state_visible: jax.Array | None = None,
     ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
         input_mask = []
         ar_mask = []
@@ -203,7 +439,9 @@ class Pi0(_model.BaseModel):
         # add a single state token
         state_token = self.state_proj(obs.state)[:, None, :]
         tokens.append(state_token)
-        input_mask.append(jnp.ones((obs.state.shape[0], 1), dtype=jnp.bool_))
+        if current_state_visible is None:
+            current_state_visible = jnp.ones(obs.state.shape[:-1], dtype=jnp.bool_)
+        input_mask.append(current_state_visible[:, None])
         # image/language inputs do not attend to state or actions
         ar_mask += [True]
 
@@ -216,6 +454,11 @@ class Pi0(_model.BaseModel):
         action_time_tokens = self.action_time_mlp_in(action_time_tokens)
         action_time_tokens = nnx.swish(action_time_tokens)
         action_time_tokens = self.action_time_mlp_out(action_time_tokens)
+        if history_condition is not None:
+            if self.history_modulation is None:
+                raise ValueError("Received a history condition for a Pi0 model without history conditioning.")
+            scale, shift = jnp.split(self.history_modulation(history_condition), 2, axis=-1)
+            action_time_tokens = action_time_tokens * (1 + scale[:, None, :]) + shift[:, None, :]
         tokens.append(action_time_tokens)
         input_mask.append(jnp.ones(action_time_tokens.shape[:2], dtype=jnp.bool_))
         # image/language/state inputs do not attend to action tokens
@@ -225,13 +468,29 @@ class Pi0(_model.BaseModel):
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask
 
+    def embed_history_prefix(
+        self, history_condition: jax.Array
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        if self.history_token_proj is None:
+            raise ValueError("History-prefix embedding requires prefix-token conditioning.")
+        tokens = self.history_token_proj(history_condition)
+        input_mask = jnp.ones(tokens.shape[:2], dtype=jnp.bool_)
+        ar_mask = jnp.concatenate([
+            jnp.ones((1,), dtype=jnp.bool_),
+            jnp.zeros((tokens.shape[1] - 1,), dtype=jnp.bool_),
+        ])
+        return tokens, input_mask, ar_mask
+
     @override
     def compute_loss(self,
                      rng: at.KeyArrayLike,
                      observation: _model.Observation,
                      actions: _model.Actions,
                      *,
-                     train: bool = False) -> at.Float[at.Array, "*b ah"]:
+                     train: bool = False,
+                     history_condition: jax.Array | None = None,
+                     current_image_visible: jax.Array | None = None,
+                     current_state_visible: jax.Array | None = None) -> at.Float[at.Array, "*b ah"]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
@@ -243,8 +502,31 @@ class Pi0(_model.BaseModel):
         u_t = noise - actions
 
         # one big forward pass of prefix + suffix at once
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        suffix_tokens, suffix_mask, suffix_ar_mask = self.embed_suffix(observation, x_t, time)
+        single_token_mode = self.history_conditioner is not None and (
+            self.history_conditioner.config.conditioning_mode == "single_token"
+        )
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(
+            observation,
+            history_condition=history_condition if single_token_mode else None,
+            current_image_visible=current_image_visible,
+        )
+        prefix_mode = self.history_conditioner is not None and (
+            self.history_conditioner.config.conditioning_mode == "prefix_tokens"
+        )
+        suffix_tokens, suffix_mask, suffix_ar_mask = self.embed_suffix(
+            observation,
+            x_t,
+            time,
+            history_condition=None if prefix_mode or single_token_mode else history_condition,
+            current_state_visible=current_state_visible,
+        )
+        if prefix_mode:
+            if history_condition is None:
+                raise ValueError("Prefix-token history conditioning requires history tokens.")
+            history_tokens, history_mask, history_ar_mask = self.embed_history_prefix(history_condition)
+            suffix_tokens = jnp.concatenate([history_tokens, suffix_tokens], axis=1)
+            suffix_mask = jnp.concatenate([history_mask, suffix_mask], axis=1)
+            suffix_ar_mask = jnp.concatenate([history_ar_mask, suffix_ar_mask], axis=0)
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
         attn_mask = make_attn_mask(input_mask, ar_mask)
@@ -256,6 +538,25 @@ class Pi0(_model.BaseModel):
 
         return jnp.mean(jnp.square(v_t - u_t), axis=-1)
 
+    def compute_loss_with_history(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        visual_features: jax.Array,
+        history_states: jax.Array,
+        history_valid_mask: jax.Array,
+        anchor_indices: jax.Array,
+        *,
+        train: bool = False,
+    ) -> at.Float[at.Array, "*b ah"]:
+        history_condition = self.encode_history_conditions(
+            visual_features, history_states, history_valid_mask, anchor_indices, train=train
+        )
+        return self.compute_loss(
+            rng, observation, actions, train=train, history_condition=history_condition
+        )
+
     @override
     def sample_actions(
         self,
@@ -263,6 +564,7 @@ class Pi0(_model.BaseModel):
         observation: _model.Observation,
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
+        history_condition: jax.Array | None = None,
     ) -> _model.Actions:
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
@@ -271,32 +573,57 @@ class Pi0(_model.BaseModel):
         batch_size = observation.state.shape[0]
         noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
-        # first fill KV cache with a forward pass of the prefix
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
-        positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+        prefix_mode = self.history_conditioner is not None and (
+            self.history_conditioner.config.conditioning_mode == "prefix_tokens"
+        )
+        if prefix_mode and history_condition is None:
+            raise ValueError("Prefix-token history conditioning requires history tokens.")
+
+        # First fill the KV cache with image/language and, in prefix mode, history tokens.
+        single_token_mode = self.history_conditioner is not None and (
+            self.history_conditioner.config.conditioning_mode == "single_token"
+        )
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(
+            observation, history_condition=history_condition if single_token_mode else None
+        )
+        history_tokens = None
+        if prefix_mode:
+            history_tokens, history_mask, history_ar_mask = self.embed_history_prefix(history_condition)
+            prefill_mask = jnp.concatenate([prefix_mask, history_mask], axis=1)
+            prefill_ar_mask = jnp.concatenate([prefix_ar_mask, history_ar_mask], axis=0)
+        else:
+            prefill_mask = prefix_mask
+            prefill_ar_mask = prefix_ar_mask
+        prefill_attn_mask = make_attn_mask(prefill_mask, prefill_ar_mask)
+        positions = jnp.cumsum(prefill_mask, axis=1) - 1
+        _, kv_cache = self.PaliGemma.llm(
+            [prefix_tokens, history_tokens], mask=prefill_attn_mask, positions=positions
+        )
 
         def step(carry):
             x_t, time = carry
-            suffix_tokens, suffix_mask, suffix_ar_mask = self.embed_suffix(observation, x_t,
-                                                                           jnp.broadcast_to(time, batch_size))
+            suffix_tokens, suffix_mask, suffix_ar_mask = self.embed_suffix(
+                observation,
+                x_t,
+                jnp.broadcast_to(time, batch_size),
+                history_condition=None if prefix_mode or single_token_mode else history_condition,
+            )
             # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
             # other
             suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
             # `prefix_attn_mask` is shape (b, suffix_len, prefix_len) indicating how the suffix tokens can attend to the
             # prefix tokens
-            prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+            prefix_attn_mask = einops.repeat(prefill_mask, "b p -> b s p", s=suffix_tokens.shape[1])
             # `combined_mask` is shape (b, suffix_len, prefix_len + suffix_len) indicating how the suffix tokens (which
             # generate the queries) can attend to the full prefix + suffix sequence (which generates the keys and values)
             full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
             assert full_attn_mask.shape == (
                 batch_size,
                 suffix_tokens.shape[1],
-                prefix_tokens.shape[1] + suffix_tokens.shape[1],
+                prefill_mask.shape[1] + suffix_tokens.shape[1],
             )
             # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
-            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+            positions = jnp.sum(prefill_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
 
             (prefix_out, suffix_out), _ = self.PaliGemma.llm([None, suffix_tokens],
                                                              mask=full_attn_mask,

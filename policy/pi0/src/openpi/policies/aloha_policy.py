@@ -192,20 +192,32 @@ def _decode_state(state: np.ndarray, *, adapt_to_pi: bool = False) -> np.ndarray
         # Flip the joints.
         state = _joint_flip_mask() * state
         # Reverse the gripper transformation that is being applied by the Aloha runtime.
-        state[[6, 13]] = _gripper_to_angular(state[[6, 13]])
+        state[..., [6, 13]] = _gripper_to_angular(state[..., [6, 13]])
     return state
+
+
+def prepare_aloha_state(state: np.ndarray, action_dim: int, *, adapt_to_pi: bool = False) -> np.ndarray:
+    """Apply the exact Aloha conversion and padding shared by current and history states."""
+    return transforms.pad_to_dim(_decode_state(np.asarray(state), adapt_to_pi=adapt_to_pi), action_dim)
+
+
+def prepare_aloha_actions(actions: np.ndarray, action_dim: int, *, adapt_to_pi: bool = False) -> np.ndarray:
+    """Apply the exact Aloha conversion and padding shared by current and history actions."""
+    return transforms.pad_to_dim(
+        _encode_actions_inv(np.asarray(actions), adapt_to_pi=adapt_to_pi), action_dim
+    )
 
 
 def _encode_actions(actions: np.ndarray, *, adapt_to_pi: bool = False) -> np.ndarray:
     if adapt_to_pi:
         # Flip the joints.
         actions = _joint_flip_mask() * actions
-        actions[:, [6, 13]] = _gripper_from_angular(actions[:, [6, 13]])
+        actions[..., [6, 13]] = _gripper_from_angular(actions[..., [6, 13]])
     return actions
 
 
 def _encode_actions_inv(actions: np.ndarray, *, adapt_to_pi: bool = False) -> np.ndarray:
     if adapt_to_pi:
         actions = _joint_flip_mask() * actions
-        actions[:, [6, 13]] = _gripper_from_angular_inv(actions[:, [6, 13]])
+        actions[..., [6, 13]] = _gripper_from_angular_inv(actions[..., [6, 13]])
     return actions

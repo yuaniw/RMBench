@@ -5,6 +5,9 @@ Example usage: uv run examples/aloha_real/convert_aloha_data_to_lerobot.py --raw
 """
 
 import dataclasses
+import fnmatch
+import json
+import os
 from pathlib import Path
 import shutil
 from typing import Literal
@@ -17,9 +20,6 @@ import numpy as np
 import torch
 import tqdm
 import tyro
-import json
-import os
-import fnmatch
 
 
 @dataclasses.dataclass(frozen=True)
@@ -204,6 +204,7 @@ def populate_dataset(
     dataset: LeRobotDataset,
     hdf5_files: list[Path],
     task: str,
+    rng: np.random.Generator,
     episodes: list[int] | None = None,
 ) -> LeRobotDataset:
     if episodes is None:
@@ -215,13 +216,12 @@ def populate_dataset(
         imgs_per_cam, state, action, velocity, effort = load_raw_episode_data(ep_path)
         num_frames = state.shape[0]
         # add prompt
-        dir_path = os.path.dirname(ep_path)
-        json_Path = f"{dir_path}/instructions.json"
+        instruction_path = ep_path.parent / "instructions.json"
 
-        with open(json_Path, 'r') as f_instr:
+        with instruction_path.open("r") as f_instr:
             instruction_dict = json.load(f_instr)
-            instructions = instruction_dict['instructions']
-            instruction = np.random.choice(instructions)
+            instructions = instruction_dict["instructions"]
+            instruction = rng.choice(instructions)
         for i in range(num_frames):
             frame = {
                 "observation.state": state[i],
@@ -253,6 +253,7 @@ def port_aloha(
     is_mobile: bool = False,
     mode: Literal["video", "image"] = "image",
     dataset_config: DatasetConfig = DEFAULT_DATASET_CONFIG,
+    seed: int = 0,
 ):
     if (HF_LEROBOT_HOME / repo_id).exists():
         shutil.rmtree(HF_LEROBOT_HOME / repo_id)
@@ -264,8 +265,9 @@ def port_aloha(
     hdf5_files = []
     for root, _, files in os.walk(raw_dir):
         for filename in fnmatch.filter(files, '*.hdf5'):
-            file_path = os.path.join(root, filename)
+            file_path = Path(root) / filename
             hdf5_files.append(file_path)
+    hdf5_files.sort(key=lambda path: int(path.stem.rsplit("_", 1)[-1]))
 
     dataset = create_empty_dataset(
         repo_id,
@@ -279,6 +281,7 @@ def port_aloha(
         dataset,
         hdf5_files,
         task=task,
+        rng=np.random.default_rng(seed),
         episodes=episodes,
     )
     # dataset.consolidate()

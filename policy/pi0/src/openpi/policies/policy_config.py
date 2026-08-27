@@ -2,7 +2,7 @@ from collections.abc import Sequence
 import dataclasses
 import logging
 import pathlib
-from typing import Any
+from typing import Any, Literal
 
 import jax.numpy as jnp
 
@@ -35,7 +35,8 @@ def create_trained_policy(
     sample_kwargs: dict[str, Any] | None = None,
     default_prompt: str | None = None,
     norm_stats: dict[str, transforms.NormStats] | None = None,
-    robotwin_repo_id: str | None = None,
+    asset_id: str | None = None,
+    history_overflow: Literal["error", "hold", "slide"] = "error",
 ) -> _policy.Policy:
     """Create a policy from a trained checkpoint.
 
@@ -49,6 +50,9 @@ def create_trained_policy(
             data if it doesn't already exist.
         norm_stats: The norm stats to use for the policy. If not provided, the norm stats will be loaded
             from the checkpoint directory.
+        asset_id: Asset directory name inside the checkpoint. Defaults to the training data config's asset id.
+        history_overflow: Behavior after a Transformer history cache reaches its trained maximum length. ``slide``
+            keeps the most recent window and supports indefinitely long episodes with bounded memory.
     """
     repack_transforms = repack_transforms or transforms.Group()
     checkpoint_dir = download.maybe_download(str(checkpoint_dir))
@@ -60,12 +64,10 @@ def create_trained_policy(
     if norm_stats is None:
         # We are loading the norm stats from the checkpoint instead of the config assets dir to make sure
         # that the policy is using the same normalization stats as the original training process.
-        if data_config.asset_id is None:
+        norm_asset_id = asset_id or data_config.asset_id
+        if norm_asset_id is None:
             raise ValueError("Asset id is required to load norm stats.")
-        # print(f"!!!!{data_config.asset_id}")
-        # print(robotwin_repo_id)
-        data_config.asset_id = robotwin_repo_id
-        norm_stats = _checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)
+        norm_stats = _checkpoints.load_norm_stats(checkpoint_dir / "assets", norm_asset_id)
 
     return _policy.Policy(
         model,
@@ -84,4 +86,5 @@ def create_trained_policy(
         ],
         sample_kwargs=sample_kwargs,
         metadata=train_config.policy_metadata,
+        history_overflow=history_overflow,
     )

@@ -5,6 +5,8 @@ will compute the mean and standard deviation of the data in the dataset and save
 to the config assets directory.
 """
 
+import pathlib
+
 import numpy as np
 import tqdm
 import tyro
@@ -21,7 +23,7 @@ class RemoveStrings(transforms.DataTransformFn):
         return {k: v for k, v in x.items() if not np.issubdtype(np.asarray(v).dtype, np.str_)}
 
 
-def create_dataset(config: _config.TrainConfig, ) -> tuple[_config.DataConfig, _data_loader.Dataset]:
+def create_dataset(config: _config.TrainConfig) -> tuple[_config.DataConfig, _data_loader.Dataset]:
     data_config = config.data.create(config.assets_dirs, config.model)
     if data_config.repo_id is None:
         raise ValueError("Data config must have a repo_id")
@@ -38,7 +40,12 @@ def create_dataset(config: _config.TrainConfig, ) -> tuple[_config.DataConfig, _
     return data_config, dataset
 
 
-def main(config_name: str, max_frames: int | None = None):
+def main(
+    config_name: str,
+    max_frames: int | None = None,
+    batch_size: int = 8,
+    num_workers: int = 0,
+):
     config = _config.get_config(config_name)
     data_config, dataset = create_dataset(config)
 
@@ -49,25 +56,26 @@ def main(config_name: str, max_frames: int | None = None):
         num_frames = max_frames
         shuffle = True
 
+    num_batches = num_frames // batch_size
     data_loader = _data_loader.TorchDataLoader(
         dataset,
-        local_batch_size=8,
-        num_workers=8,
+        local_batch_size=batch_size,
+        num_workers=num_workers,
         shuffle=shuffle,
-        num_batches=num_frames,
+        num_batches=num_batches,
     )
 
     keys = ["state", "actions"]
     stats = {key: normalize.RunningStats() for key in keys}
 
-    for batch in tqdm.tqdm(data_loader, total=num_frames, desc="Computing stats"):
+    for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):
         for key in keys:
-            values = np.asarray(batch[key][0])
+            values = np.asarray(batch[key])
             stats[key].update(values.reshape(-1, values.shape[-1]))
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 
-    output_path = config.assets_dirs / data_config.repo_id
+    output_path = pathlib.Path(data_config.assets_dir) / data_config.asset_id
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)
 

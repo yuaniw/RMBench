@@ -1,5 +1,6 @@
 import dataclasses
 import logging
+import pathlib
 import re
 from typing import Protocol, runtime_checkable
 
@@ -57,6 +58,94 @@ class CheckpointWeightLoader(WeightLoader):
 
 
 @dataclasses.dataclass(frozen=True)
+class HistoryCheckpointWeightLoader(WeightLoader):
+    """Loads a Pi0 checkpoint while initializing only explicitly allowed history parameters."""
+
+    params_path: str
+
+    def load(self, params: at.Params) -> at.Params:
+        loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
+        return _merge_params(
+            loaded_params,
+            params,
+            missing_regex=r".*(history_conditioner|history_modulation|history_token_proj).*",
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class PretrainedHistoryCheckpointWeightLoader(WeightLoader):
+    """Loads dense pretrained Pi0 weights and initializes the added LoRA and history parameters."""
+
+    params_path: str
+
+    def load(self, params: at.Params) -> at.Params:
+        params_path = pathlib.Path(self.params_path).expanduser()
+        loaded_params = _model.restore_params(download.maybe_download(str(params_path)), restore_type=np.ndarray)
+        return _merge_params(
+            loaded_params,
+            params,
+            missing_regex=r".*(lora|history_conditioner|history_modulation|history_token_proj).*",
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class PretrainedDualSiglipHistoryCheckpointWeightLoader(WeightLoader):
+    """Loads official Pi0 weights and duplicates its SigLIP for frozen history inference."""
+
+    params_path: str
+
+    def load(self, params: at.Params) -> at.Params:
+        params_path = pathlib.Path(self.params_path).expanduser()
+        loaded_params = _model.restore_params(
+            download.maybe_download(str(params_path)), restore_type=np.ndarray
+        )
+        merged = _merge_params(
+            loaded_params,
+            params,
+            missing_regex=(
+                r".*(lora|history_conditioner|history_modulation|history_token_proj|"
+                r"history_image_encoder).*"
+            ),
+        )
+        return _copy_subtree(
+            merged,
+            loaded_params,
+            params,
+            source_prefix="PaliGemma/img/",
+            target_prefix="history_image_encoder/",
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class OfficialPi0WithTrainedSiglipWeightLoader(WeightLoader):
+    """Loads official Pi0 weights and overlays SigLIP from a trained checkpoint."""
+
+    official_params_path: str
+    trained_siglip_params_path: str
+
+    def load(self, params: at.Params) -> at.Params:
+        official_path = pathlib.Path(self.official_params_path).expanduser()
+        trained_siglip_path = pathlib.Path(self.trained_siglip_params_path).expanduser()
+        official_params = _model.restore_params(
+            download.maybe_download(str(official_path)), restore_type=np.ndarray
+        )
+        trained_params = _model.restore_params(
+            download.maybe_download(str(trained_siglip_path)), restore_type=np.ndarray
+        )
+        merged = _merge_params(
+            official_params,
+            params,
+            missing_regex=r".*(lora|history_conditioner|history_modulation|history_token_proj).*",
+        )
+        return _overlay_subtree(
+            merged,
+            trained_params,
+            params,
+            subtree_prefix="PaliGemma/img/",
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class PaliGemmaWeightLoader(WeightLoader):
     """Loads weights from the official PaliGemma checkpoint.
 
@@ -102,4 +191,44 @@ def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex:
         if k not in result:
             result[k] = flat_ref[k]
 
+    return flax.traverse_util.unflatten_dict(result, sep="/")
+
+
+def _overlay_subtree(
+    base_params: at.Params,
+    overlay_params: at.Params,
+    reference_params: at.Params,
+    *,
+    subtree_prefix: str,
+) -> at.Params:
+    """Replaces one complete parameter subtree while preserving the base elsewhere."""
+    flat_base = flax.traverse_util.flatten_dict(base_params, sep="/")
+    flat_overlay = flax.traverse_util.flatten_dict(overlay_params, sep="/")
+    flat_reference = flax.traverse_util.flatten_dict(reference_params, sep="/")
+
+    result = dict(flat_base)
+    for key, reference_value in flat_reference.items():
+        if key.startswith(subtree_prefix):
+            result[key] = flat_overlay[key].astype(reference_value.dtype)
+    return flax.traverse_util.unflatten_dict(result, sep="/")
+
+
+def _copy_subtree(
+    base_params: at.Params,
+    source_params: at.Params,
+    reference_params: at.Params,
+    *,
+    source_prefix: str,
+    target_prefix: str,
+) -> at.Params:
+    """Copies a complete source subtree to a differently named target subtree."""
+    flat_base = flax.traverse_util.flatten_dict(base_params, sep="/")
+    flat_source = flax.traverse_util.flatten_dict(source_params, sep="/")
+    flat_reference = flax.traverse_util.flatten_dict(reference_params, sep="/")
+
+    result = dict(flat_base)
+    for key, reference_value in flat_reference.items():
+        if key.startswith(target_prefix):
+            source_key = source_prefix + key.removeprefix(target_prefix)
+            result[key] = flat_source[source_key].astype(reference_value.dtype)
     return flax.traverse_util.unflatten_dict(result, sep="/")

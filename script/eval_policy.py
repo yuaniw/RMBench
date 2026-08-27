@@ -25,6 +25,29 @@ current_file_path = os.path.abspath(__file__)
 parent_directory = os.path.dirname(current_file_path)
 
 
+def _sanitize_path_component(value):
+    return str(value).replace(os.sep, "_").replace(" ", "_")
+
+
+def build_eval_save_dir(usr_args, root_dir="eval_result"):
+    task_name = _sanitize_path_component(usr_args["task_name"])
+    policy_name = _sanitize_path_component(usr_args["policy_name"])
+    task_config = _sanitize_path_component(usr_args["task_config"])
+    ckpt_setting = _sanitize_path_component(usr_args["ckpt_setting"])
+    config_name = _sanitize_path_component(usr_args["config_name"])
+    seed = _sanitize_path_component(usr_args["seed"])
+    checkpoint_num = _sanitize_path_component(usr_args["checkpoint_num"])
+
+    setup_name = config_name
+    if "mamba_version" in usr_args and usr_args["mamba_version"]:
+        setup_name = f"{setup_name}_{_sanitize_path_component(usr_args['mamba_version'])}"
+
+    run_name = datetime.now().strftime("run_%Y%m%d_%H%M%S_%f")
+    return Path(
+        root_dir
+    ) / task_name / policy_name / task_config / ckpt_setting / setup_name / f"seed_{seed}" / f"ckpt_{checkpoint_num}" / run_name
+
+
 def class_decorator(task_name):
     envs_module = importlib.import_module(f"envs.{task_name}")
     try:
@@ -121,8 +144,19 @@ def main(usr_args):
     else:
         embodiment_name = str(embodiment_type[0]) + "+" + str(embodiment_type[1])
 
-    save_dir = Path(f"eval_result/{task_name}/{policy_name}/{task_config}/{ckpt_setting}/{current_time}")
+    usr_args["left_arm_dim"] = len(args["left_embodiment_config"]["arm_joints_name"][0])
+    usr_args["right_arm_dim"] = len(args["right_embodiment_config"]["arm_joints_name"][1])
+    if policy_name == "DP" and "config_name" not in usr_args:
+        action_dim = usr_args["left_arm_dim"] + usr_args["right_arm_dim"] + 2
+        usr_args["config_name"] = f"robot_dp_{action_dim}"
+    elif "config_name" not in usr_args:
+        usr_args["config_name"] = policy_name
+    if "checkpoint_num" not in usr_args:
+        usr_args["checkpoint_num"] = ckpt_setting
+
+    save_dir = build_eval_save_dir(usr_args)
     save_dir.mkdir(parents=True, exist_ok=True)
+    usr_args["eval_save_dir"] = str(save_dir)
 
     log_file = save_dir / "eval_log.txt"
     args["log_file"] = str(log_file)
@@ -158,8 +192,6 @@ def main(usr_args):
 
     TASK_ENV = class_decorator(args["task_name"])
     args["policy_name"] = policy_name
-    usr_args["left_arm_dim"] = len(args["left_embodiment_config"]["arm_joints_name"][0])
-    usr_args["right_arm_dim"] = len(args["right_embodiment_config"]["arm_joints_name"][1])
 
     seed = usr_args["seed"]
 
@@ -354,6 +386,7 @@ def eval_policy(task_name,
         # TASK_ENV._take_picture()
         now_seed += 1
 
+    reset_func(model)
     return now_seed, TASK_ENV.suc, task_total_reward
 
 

@@ -13,12 +13,12 @@ import flax.nnx as nnx
 from typing_extensions import override
 import tyro
 
+import openpi.models.history as history
 import openpi.models.model as _model
 import openpi.models.pi0 as pi0
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
-import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
@@ -64,6 +64,7 @@ class DataConfig:
     repo_id: str | None = None
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
+    assets_dir: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
     norm_stats: dict[str, _transforms.NormStats] | None = None
 
@@ -149,6 +150,7 @@ class DataConfigFactory(abc.ABC):
             self.base_config or DataConfig(),
             repo_id=repo_id,
             asset_id=asset_id,
+            assets_dir=str(self.assets.assets_dir or assets_dirs),
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
         )
 
@@ -311,6 +313,7 @@ class TrainConfig:
 
     # Determines the data to be trained on.
     data: DataConfigFactory = dataclasses.field(default_factory=FakeDataConfig)
+    history_data: "HistoryDataConfig | None" = None
 
     # Base directory for config assets (e.g., norm stats).
     assets_base_dir: str = "./assets"
@@ -330,7 +333,7 @@ class TrainConfig:
     # How often (in steps) to log training metrics.
     log_interval: int = 100
     # How often (in steps) to save checkpoints.
-    save_interval: int = 1000
+    save_interval: int = 5000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
     keep_period: int | None = 5000
 
@@ -373,6 +376,25 @@ class TrainConfig:
             raise ValueError("Cannot resume and overwrite at the same time.")
 
 
+@dataclasses.dataclass(frozen=True)
+class HistoryDataConfig:
+    cache_dir: str | None = None
+    source_checkpoint_params: str | None = None
+    online_image_history: bool = False
+    max_episode_steps: int | None = 384
+    episode_length_bucket_size: int | None = None
+    anchors_per_episode: int = 8
+    gradient_accumulate_episodes: int = 4
+    # Single-token anti-shortcut controls. Defaults reproduce the original FiLM behavior
+    # (current observation always fully visible, no auxiliary losses).
+    augment_current_observation: bool = False
+    full_input_probability: float = 1.0
+    image_dropout_probability: float = 0.0
+    strict_past_probability: float = 0.0
+    history_action_loss_weight: float = 0.0
+    state_action_loss_weight: float = 0.0
+
+
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
     ###
@@ -381,9 +403,12 @@ _CONFIGS = [
     # pi0_base by lora
     TrainConfig(
         name="pi0_base_aloha_robotwin_lora",
-        model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora",
+                            action_expert_variant="gemma_300m_lora",
+                            max_token_len=64
+                            ),
         data=LeRobotAlohaDataConfig(
-            repo_id="test",  # your datasets repo_id
+            repo_id="put_back_block-demo_clean-50",  # your datasets repo_id
             adapt_to_pi=False,
             repack_transforms=_transforms.Group(inputs=[
                 _transforms.RepackTransform({
@@ -404,10 +429,110 @@ _CONFIGS = [
         ),
         freeze_filter=pi0.Pi0Config(paligemma_variant="gemma_2b_lora",
                                     action_expert_variant="gemma_300m_lora").get_freeze_filter(),
-        batch_size=32,  # the total batch_size not pre_gpu batch_size
+        batch_size=128,  # the total batch_size not pre_gpu batch_size
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=30000,
-        fsdp_devices=1,  # refer line 359
+        num_train_steps=10000,
+        fsdp_devices=4,  # refer line 359
+    ),
+    TrainConfig(
+        name="pi0_base_aloha_robotwin_lora_history_transformer",
+        model=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            max_token_len=64,
+            history=history.HistoryEncoderConfig(encoder_type="transformer"),
+        ),
+        data=LeRobotAlohaDataConfig(
+            repo_id="put_back_block-demo_clean-50",
+            adapt_to_pi=False,
+            assets=AssetsConfig(
+                assets_dir="./assets/pi0_base_aloha_robotwin_lora",
+                asset_id="put_back_block-demo_clean-50",
+            ),
+            repack_transforms=_transforms.Group(inputs=[
+                _transforms.RepackTransform({
+                    "images": {
+                        "cam_high": "observation.images.cam_high",
+                        "cam_left_wrist": "observation.images.cam_left_wrist",
+                        "cam_right_wrist": "observation.images.cam_right_wrist",
+                    },
+                    "state": "observation.state",
+                    "actions": "action",
+                    "prompt": "prompt",
+                })
+            ]),
+            base_config=DataConfig(local_files_only=True, prompt_from_task=True),
+        ),
+        history_data=HistoryDataConfig(
+            cache_dir="./history_cache/put_back_block-demo_clean-50",
+            source_checkpoint_params=(
+                "./checkpoints/pi0_base_aloha_robotwin_lora/put_back_block-demo_clean-50/10000/params"
+            ),
+        ),
+        freeze_filter=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            history=history.HistoryEncoderConfig(encoder_type="transformer"),
+        ).get_freeze_filter(),
+        batch_size=1,
+        num_workers=0,
+        weight_loader=weight_loaders.HistoryCheckpointWeightLoader(
+            "./checkpoints/pi0_base_aloha_robotwin_lora/put_back_block-demo_clean-50/10000/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(peak_lr=2.5e-5, decay_steps=10_000, decay_lr=2.5e-6),
+        ema_decay=None,
+        num_train_steps=10_000,
+        fsdp_devices=1,
+    ),
+    TrainConfig(
+        name="pi0_base_aloha_robotwin_lora_history_mamba",
+        model=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            max_token_len=64,
+            history=history.HistoryEncoderConfig(encoder_type="mamba"),
+        ),
+        data=LeRobotAlohaDataConfig(
+            repo_id="put_back_block-demo_clean-50",
+            adapt_to_pi=False,
+            assets=AssetsConfig(
+                assets_dir="./assets/pi0_base_aloha_robotwin_lora",
+                asset_id="put_back_block-demo_clean-50",
+            ),
+            repack_transforms=_transforms.Group(inputs=[
+                _transforms.RepackTransform({
+                    "images": {
+                        "cam_high": "observation.images.cam_high",
+                        "cam_left_wrist": "observation.images.cam_left_wrist",
+                        "cam_right_wrist": "observation.images.cam_right_wrist",
+                    },
+                    "state": "observation.state",
+                    "actions": "action",
+                    "prompt": "prompt",
+                })
+            ]),
+            base_config=DataConfig(local_files_only=True, prompt_from_task=True),
+        ),
+        history_data=HistoryDataConfig(
+            cache_dir="./history_cache/put_back_block-demo_clean-50",
+            source_checkpoint_params=(
+                "./checkpoints/pi0_base_aloha_robotwin_lora/put_back_block-demo_clean-50/10000/params"
+            ),
+        ),
+        freeze_filter=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            history=history.HistoryEncoderConfig(encoder_type="mamba"),
+        ).get_freeze_filter(),
+        batch_size=1,
+        num_workers=0,
+        weight_loader=weight_loaders.HistoryCheckpointWeightLoader(
+            "./checkpoints/pi0_base_aloha_robotwin_lora/put_back_block-demo_clean-50/10000/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(peak_lr=2.5e-5, decay_steps=10_000, decay_lr=2.5e-6),
+        ema_decay=None,
+        num_train_steps=10_000,
+        fsdp_devices=1,
     ),
     # pi0_fast_base by lora
     TrainConfig(
@@ -502,6 +627,442 @@ _CONFIGS = [
         fsdp_devices=1,  # refer line 359
     ),
 ]
+
+# Four-device FSDP variants keep one episode replicated and shard its gathered anchor batch.
+for history_config_name in (
+    "pi0_base_aloha_robotwin_lora_history_transformer",
+    "pi0_base_aloha_robotwin_lora_history_mamba",
+):
+    history_config = next(config for config in _CONFIGS if config.name == history_config_name)
+    _CONFIGS.append(
+        dataclasses.replace(
+            history_config,
+            name=f"{history_config_name}_fsdp4",
+            history_data=dataclasses.replace(
+                history_config.history_data,
+                anchors_per_episode=32,
+                gradient_accumulate_episodes=1,
+            ),
+            fsdp_devices=4,
+        )
+    )
+
+# Direct experiment: official dense Pi0 -> frozen SigLIP cache -> action-expert LoRA + history Transformer.
+pretrained_history_base = next(
+    config for config in _CONFIGS if config.name == "pi0_base_aloha_robotwin_lora_history_transformer"
+)
+pretrained_pi0_params = "~/.cache/openpi/openpi-assets/checkpoints/pi0_base/params"
+trained_robotwin_params = (
+    "./checkpoints/pi0_base_aloha_robotwin_lora/put_back_block-demo_clean-50/10000/params"
+)
+pretrained_history_model = pi0.Pi0Config(
+    paligemma_variant="gemma_2b",
+    action_expert_variant="gemma_300m_lora",
+    max_token_len=64,
+    history=history.HistoryEncoderConfig(encoder_type="transformer"),
+)
+_CONFIGS.append(
+    dataclasses.replace(
+        pretrained_history_base,
+        name="pi0_base_aloha_robotwin_pretrained",
+        model=pi0.Pi0Config(max_token_len=64),
+        history_data=None,
+        freeze_filter=pi0.Pi0Config(max_token_len=64).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader(pretrained_pi0_params),
+        fsdp_devices=1,
+    )
+)
+_CONFIGS.append(
+    dataclasses.replace(
+        pretrained_history_base,
+        name="pi0_base_aloha_robotwin_lora_history_transformer_pretrained_fsdp4",
+        model=pretrained_history_model,
+        history_data=dataclasses.replace(
+            pretrained_history_base.history_data,
+            cache_dir="./history_cache/put_back_block-demo_clean-50-pi0-base",
+            source_checkpoint_params=pretrained_pi0_params,
+            anchors_per_episode=32,
+            gradient_accumulate_episodes=1,
+        ),
+        freeze_filter=pretrained_history_model.get_freeze_filter(),
+        weight_loader=weight_loaders.PretrainedHistoryCheckpointWeightLoader(pretrained_pi0_params),
+        fsdp_devices=4,
+    )
+)
+
+# Longer direct-pretrained experiment: train LoRA in both the PaliGemma VLM and action expert,
+# together with the history Transformer and FiLM. Dense VLM/SigLIP/action weights remain frozen.
+pretrained_vlm_lora_history_model = dataclasses.replace(
+    pretrained_history_model,
+    paligemma_variant="gemma_2b_lora",
+    history_train_scope="history_vlm_action_lora",
+)
+pretrained_vlm_lora_history_config = dataclasses.replace(
+    pretrained_history_base,
+    name="pi0_base_aloha_robotwin_lora_history_transformer_pretrained_vlm_lora_30k_fsdp4",
+    model=pretrained_vlm_lora_history_model,
+    history_data=dataclasses.replace(
+        pretrained_history_base.history_data,
+        cache_dir="./history_cache/put_back_block-demo_clean-50-pi0-base",
+        source_checkpoint_params=pretrained_pi0_params,
+        anchors_per_episode=32,
+        gradient_accumulate_episodes=1,
+    ),
+    freeze_filter=pretrained_vlm_lora_history_model.get_freeze_filter(),
+    weight_loader=weight_loaders.PretrainedHistoryCheckpointWeightLoader(pretrained_pi0_params),
+    lr_schedule=_optimizer.CosineDecaySchedule(
+        peak_lr=2.5e-5,
+        decay_steps=30_000,
+        decay_lr=2.5e-6,
+    ),
+    num_train_steps=30_000,
+    fsdp_devices=4,
+)
+_CONFIGS.append(pretrained_vlm_lora_history_config)
+
+# Controlled positional-encoding ablation: keep the pretrained VLM-LoRA
+# baseline data, cache, padding, and optimization recipe unchanged, run on one
+# GPU, and replace only the history Transformer's learned absolute positions
+# with RoPE.
+pretrained_vlm_lora_history_rope_baseline_model = dataclasses.replace(
+    pretrained_vlm_lora_history_model,
+    history=dataclasses.replace(
+        pretrained_vlm_lora_history_model.history,
+        position_encoding="rope",
+        remat_policy="none",
+    ),
+)
+pretrained_vlm_lora_history_rope_baseline_config = dataclasses.replace(
+    pretrained_vlm_lora_history_config,
+    name="pi0_base_aloha_robotwin_lora_history_transformer_pretrained_vlm_lora_rope_baseline_30k_1gpu",
+    model=pretrained_vlm_lora_history_rope_baseline_model,
+    fsdp_devices=1,
+)
+_CONFIGS.append(pretrained_vlm_lora_history_rope_baseline_config)
+
+pretrained_vlm_lora_mamba_history_model = dataclasses.replace(
+    pretrained_vlm_lora_history_model,
+    history=dataclasses.replace(pretrained_vlm_lora_history_model.history, encoder_type="mamba"),
+)
+_CONFIGS.append(
+    dataclasses.replace(
+        pretrained_vlm_lora_history_config,
+        name="pi0_base_aloha_robotwin_lora_history_mamba_pretrained_vlm_lora_30k_fsdp4",
+        model=pretrained_vlm_lora_mamba_history_model,
+        freeze_filter=pretrained_vlm_lora_mamba_history_model.get_freeze_filter(),
+    )
+)
+
+# Online shared-SigLIP history experiment: encode the whole episode with the same SigLIP used for
+# the current observation, stop gradients before the history encoder, and retain current-image
+# gradients through the VLM/action loss.
+pretrained_vlm_lora_siglip_history_model = dataclasses.replace(
+    pretrained_vlm_lora_history_model,
+    separate_history_image_encoder=False,
+    history_train_scope="history_vlm_action_lora_siglip",
+)
+_CONFIGS.append(
+    dataclasses.replace(
+        pretrained_history_base,
+        name=(
+            "pi0_base_aloha_robotwin_lora_history_transformer_pretrained_vlm_siglip1_30k_fsdp4"
+        ),
+        model=pretrained_vlm_lora_siglip_history_model,
+        history_data=dataclasses.replace(
+            pretrained_history_base.history_data,
+            cache_dir=None,
+            source_checkpoint_params=None,
+            online_image_history=True,
+            anchors_per_episode=32,
+            gradient_accumulate_episodes=1,
+        ),
+        freeze_filter=pretrained_vlm_lora_siglip_history_model.get_freeze_filter(),
+        weight_loader=weight_loaders.PretrainedHistoryCheckpointWeightLoader(pretrained_pi0_params),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+            decay_lr=2.5e-6,
+        ),
+        num_train_steps=30_000,
+        fsdp_devices=4,
+    )
+)
+_CONFIGS.append(
+    dataclasses.replace(
+        pretrained_history_base,
+        name="pi0_base_aloha_robotwin_lora_history_transformer_vlm_lora_30k_fsdp4",
+        model=pretrained_vlm_lora_history_model,
+        history_data=dataclasses.replace(
+            pretrained_history_base.history_data,
+            cache_dir="./history_cache/put_back_block-demo_clean-50",
+            source_checkpoint_params=trained_robotwin_params,
+            anchors_per_episode=32,
+            gradient_accumulate_episodes=1,
+        ),
+        freeze_filter=pretrained_vlm_lora_history_model.get_freeze_filter(),
+        weight_loader=weight_loaders.OfficialPi0WithTrainedSiglipWeightLoader(
+            official_params_path=pretrained_pi0_params,
+            trained_siglip_params_path=trained_robotwin_params,
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+            decay_lr=2.5e-6,
+        ),
+        num_train_steps=30_000,
+        fsdp_devices=4,
+    )
+)
+
+# Single-token memory experiment initialized from official Pi0 except for the Robotwin-trained
+# SigLIP. Its history cache uses the same trained SigLIP, while both Gemma branches use new LoRA.
+single_token_history_model = pi0.Pi0Config(
+    paligemma_variant="gemma_2b_lora",
+    action_expert_variant="gemma_300m_lora",
+    max_token_len=64,
+    history=history.HistoryEncoderConfig(
+        encoder_type="transformer",
+        conditioning_mode="single_token",
+        num_condition_tokens=1,
+        action_target_dim=14,
+    ),
+    history_train_scope="history_vlm_action_lora",
+)
+_CONFIGS.append(
+    dataclasses.replace(
+        pretrained_history_base,
+        name=(
+            "pi0_base_aloha_robotwin_lora_history_transformer_single_token_image_dropout_fsdp4"
+        ),
+        model=single_token_history_model,
+        history_data=dataclasses.replace(
+            pretrained_history_base.history_data,
+            cache_dir="./history_cache/put_back_block-demo_clean-50",
+            source_checkpoint_params=trained_robotwin_params,
+            anchors_per_episode=32,
+            gradient_accumulate_episodes=1,
+            full_input_probability=0.5,
+            image_dropout_probability=0.5,
+            strict_past_probability=0.0,
+            history_action_loss_weight=0.0,
+            state_action_loss_weight=0.0,
+        ),
+        freeze_filter=single_token_history_model.get_freeze_filter(),
+        weight_loader=weight_loaders.OfficialPi0WithTrainedSiglipWeightLoader(
+            official_params_path=pretrained_pi0_params,
+            trained_siglip_params_path=trained_robotwin_params,
+        ),
+        fsdp_devices=4,
+    )
+)
+
+_CONFIGS.append(
+    dataclasses.replace(
+        pretrained_history_base,
+        name=(
+            "pi0_base_aloha_robotwin_lora_history_transformer_single_token_image_fsdp4"
+        ),
+        model=single_token_history_model,
+        history_data=dataclasses.replace(
+            pretrained_history_base.history_data,
+            cache_dir="./history_cache/put_back_block-demo_clean-50",
+            source_checkpoint_params=trained_robotwin_params,
+            anchors_per_episode=32,
+            gradient_accumulate_episodes=1,
+            full_input_probability=1,
+            image_dropout_probability=0.0,
+            strict_past_probability=0.0,
+            history_action_loss_weight=0.0,
+            state_action_loss_weight=0.0,
+        ),
+        freeze_filter=single_token_history_model.get_freeze_filter(),
+        weight_loader=weight_loaders.OfficialPi0WithTrainedSiglipWeightLoader(
+            official_params_path=pretrained_pi0_params,
+            trained_siglip_params_path=trained_robotwin_params,
+        ),
+        fsdp_devices=4,
+    )
+)
+
+_CONFIGS.append(
+    dataclasses.replace(
+        pretrained_history_base,
+        name=(
+            "pi0_base_aloha_robotwin_pretrained_history_transformer_single_token_image_fsdp4"
+        ),
+        model=single_token_history_model,
+        history_data=dataclasses.replace(
+            pretrained_history_base.history_data,
+            cache_dir="./history_cache/put_back_block-demo_clean-50-pi0-base",
+            source_checkpoint_params=pretrained_pi0_params,
+            anchors_per_episode=32,
+            gradient_accumulate_episodes=1,
+            full_input_probability=1,
+            image_dropout_probability=0.0,
+            strict_past_probability=0.0,
+            history_action_loss_weight=0.0,
+            state_action_loss_weight=0.0,
+        ),
+        freeze_filter=single_token_history_model.get_freeze_filter(),
+        weight_loader=weight_loaders.PretrainedHistoryCheckpointWeightLoader(pretrained_pi0_params),
+        fsdp_devices=4,
+    )
+)
+
+
+ROBOTWIN_HISTORY_TASKS = (
+    "observe_and_pickup",
+    "rearrange_blocks",
+    "put_back_block",
+    "swap_blocks",
+    "swap_T",
+    "battery_try",
+    "blocks_ranking_try",
+    "cover_blocks",
+    "press_button",
+)
+ROBOTWIN_HISTORY_ARTIFACT_VERSION = "history-rope-v1"
+ROBOTWIN_HISTORY_ASSETS_DIR = "./assets/pi0_base_aloha_robotwin_history-rope-v1"
+
+
+def robotwin_history_repo_id(task: str) -> str:
+    if task not in ROBOTWIN_HISTORY_TASKS:
+        raise ValueError(f"Unsupported RoboTwin history task: {task}")
+    return f"{task}-demo_clean-50-{ROBOTWIN_HISTORY_ARTIFACT_VERSION}"
+
+
+def robotwin_history_precompute_config_name(task: str) -> str:
+    if task not in ROBOTWIN_HISTORY_TASKS:
+        raise ValueError(f"Unsupported RoboTwin history task: {task}")
+    return f"pi0_base_aloha_robotwin_pretrained_{task}_{ROBOTWIN_HISTORY_ARTIFACT_VERSION}"
+
+
+def robotwin_history_train_config_name(task: str) -> str:
+    if task not in ROBOTWIN_HISTORY_TASKS:
+        raise ValueError(f"Unsupported RoboTwin history task: {task}")
+    return (
+        "pi0_base_aloha_robotwin_lora_history_transformer_rope_vlm_lora_30k_1gpu_"
+        f"{task}_{ROBOTWIN_HISTORY_ARTIFACT_VERSION}"
+    )
+
+
+def _robotwin_history_data_config(task: str) -> LeRobotAlohaDataConfig:
+    repo_id = robotwin_history_repo_id(task)
+    return dataclasses.replace(
+        pretrained_history_base.data,
+        repo_id=repo_id,
+        assets=AssetsConfig(
+            assets_dir=ROBOTWIN_HISTORY_ASSETS_DIR,
+            asset_id=repo_id,
+        ),
+    )
+
+
+robotwin_history_rope_model = dataclasses.replace(
+    pretrained_vlm_lora_history_model,
+    history=dataclasses.replace(
+        pretrained_vlm_lora_history_model.history,
+        position_encoding="rope",
+        remat_policy="nothing_saveable",
+    ),
+)
+
+# Learned-absolute counterpart used to isolate positional encoding from the
+# Robotwin history-rope-v1 data/cache and training recipe.  Clamp positions
+# beyond the 384-entry table so offline training and streaming evaluation use
+# exactly the same overflow behavior without temporal wrap-around.
+robotwin_history_absolute_model = dataclasses.replace(
+    pretrained_vlm_lora_history_model,
+    history=dataclasses.replace(
+        pretrained_vlm_lora_history_model.history,
+        position_encoding="learned_absolute",
+        position_overflow="clamp",
+        remat_policy="none",
+    ),
+)
+
+
+def robotwin_history_absolute_train_config_name(task: str) -> str:
+    if task not in ROBOTWIN_HISTORY_TASKS:
+        raise ValueError(f"Unsupported RoboTwin history task: {task}")
+    return (
+        "pi0_base_aloha_robotwin_lora_history_transformer_absolute_vlm_lora_30k_1gpu_"
+        f"{task}_history-absolute-v1"
+    )
+
+for robotwin_history_task in ROBOTWIN_HISTORY_TASKS:
+    robotwin_data = _robotwin_history_data_config(robotwin_history_task)
+    robotwin_repo_id = robotwin_history_repo_id(robotwin_history_task)
+    _CONFIGS.append(
+        dataclasses.replace(
+            pretrained_history_base,
+            name=robotwin_history_precompute_config_name(robotwin_history_task),
+            model=pi0.Pi0Config(max_token_len=64),
+            data=robotwin_data,
+            history_data=None,
+            freeze_filter=pi0.Pi0Config(max_token_len=64).get_freeze_filter(),
+            weight_loader=weight_loaders.CheckpointWeightLoader(pretrained_pi0_params),
+            batch_size=1,
+            num_workers=0,
+            fsdp_devices=1,
+        )
+    )
+    _CONFIGS.append(
+        dataclasses.replace(
+            pretrained_history_base,
+            name=robotwin_history_absolute_train_config_name(robotwin_history_task),
+            model=robotwin_history_absolute_model,
+            data=robotwin_data,
+            history_data=dataclasses.replace(
+                pretrained_history_base.history_data,
+                cache_dir=f"./history_cache/{robotwin_repo_id}-pi0-base",
+                source_checkpoint_params=pretrained_pi0_params,
+                max_episode_steps=None,
+                episode_length_bucket_size=128,
+                anchors_per_episode=32,
+                gradient_accumulate_episodes=1,
+            ),
+            freeze_filter=robotwin_history_absolute_model.get_freeze_filter(),
+            weight_loader=weight_loaders.PretrainedHistoryCheckpointWeightLoader(pretrained_pi0_params),
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                peak_lr=2.5e-5,
+                decay_steps=30_000,
+                decay_lr=2.5e-6,
+            ),
+            batch_size=1,
+            num_workers=0,
+            num_train_steps=30_000,
+            fsdp_devices=1,
+        )
+    )
+    _CONFIGS.append(
+        dataclasses.replace(
+            pretrained_history_base,
+            name=robotwin_history_train_config_name(robotwin_history_task),
+            model=robotwin_history_rope_model,
+            data=robotwin_data,
+            history_data=dataclasses.replace(
+                pretrained_history_base.history_data,
+                cache_dir=f"./history_cache/{robotwin_repo_id}-pi0-base",
+                source_checkpoint_params=pretrained_pi0_params,
+                max_episode_steps=None,
+                episode_length_bucket_size=128,
+                anchors_per_episode=32,
+                gradient_accumulate_episodes=1,
+            ),
+            freeze_filter=robotwin_history_rope_model.get_freeze_filter(),
+            weight_loader=weight_loaders.PretrainedHistoryCheckpointWeightLoader(pretrained_pi0_params),
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                peak_lr=2.5e-5,
+                decay_steps=30_000,
+                decay_lr=2.5e-6,
+            ),
+            batch_size=1,
+            num_workers=0,
+            num_train_steps=30_000,
+            fsdp_devices=1,
+        )
+    )
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")

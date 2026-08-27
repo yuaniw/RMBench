@@ -161,13 +161,18 @@ if __name__ == "__main__":
         default=50,
         help="Number of episodes to process (e.g., 50)",
     )
+    parser.add_argument(
+        "--raw-root",
+        default="../../data/data",
+        help="Directory containing per-task RoboTwin data directories.",
+    )
     args = parser.parse_args()
 
     task_name = args.task_name
     setting = args.setting
     expert_data_num = args.expert_data_num
 
-    load_dir = os.path.join("../../data", str(task_name), str(setting))
+    load_dir = os.path.join(args.raw_root, str(task_name), str(setting))
 
     begin = 0
     print(f'read data from path:{os.path.join("data", load_dir)}')
