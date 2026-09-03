@@ -202,7 +202,12 @@ class Attention(nn.Module):
 
         k = _apply_rope(k, positions=positions)
 
-        # should still be half-precision here (if input was half-precision)
+        # Keep the attention path in the activation dtype after conditioning.
+        # AdaLN parameters are stored in float32, so explicit casts prevent
+        # promotion from violating the Gemma mixed-precision contract.
+        q = q.astype(dtype)
+        k = k.astype(dtype)
+        v = v.astype(dtype)
         assert q.dtype == k.dtype == v.dtype == dtype
 
         if kv_cache is not None:
@@ -286,7 +291,7 @@ class Block(nn.Module):
     dropout_bdims: tuple[int, ...] = ()
 
     @nn.compact
-    def __call__(self, xs, kv_cache, positions, attn_mask, decode, deterministic=True):  # noqa: FBT002
+    def __call__(self, xs, kv_cache, positions, attn_mask, decode, adaln_modulation=None, deterministic=True):  # noqa: FBT002
         xs = sharding.activation_sharding_constraint(xs)
         drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
 
@@ -296,6 +301,9 @@ class Block(nn.Module):
         for i, x in enumerate(xs):
             if x is not None:
                 x = RMSNorm(name=_name("pre_attention_norm", i))(x)  # noqa: PLW2901
+                if i == 1 and adaln_modulation is not None:
+                    attn_scale, attn_shift, _, _ = jnp.split(adaln_modulation, 4, axis=-1)
+                    x = x * (1 + attn_scale[:, None, :].astype(x.dtype)) + attn_shift[:, None, :].astype(x.dtype)  # noqa: PLW2901
             pre_attn.append(x)
 
         pre_attn = sharding.activation_sharding_constraint(pre_attn)
@@ -309,6 +317,9 @@ class Block(nn.Module):
         for i, (x, config) in enumerate(zip(xs, self.configs, strict=True)):
             if x is not None:
                 x = RMSNorm(name=_name("pre_ffw_norm", i))(x)  # noqa: PLW2901
+                if i == 1 and adaln_modulation is not None:
+                    _, _, mlp_scale, mlp_shift = jnp.split(adaln_modulation, 4, axis=-1)
+                    x = x * (1 + mlp_scale[:, None, :].astype(x.dtype)) + mlp_shift[:, None, :].astype(x.dtype)  # noqa: PLW2901
                 x = lora.FeedForward(  # noqa: PLW2901
                     features=config.width,
                     hidden_dim=config.mlp_dim,
@@ -351,7 +362,7 @@ class Module(nn.Module):
         block_cls = nn.remat(
             Block,
             prevent_cse=False,
-            static_argnums=(5, ),  # 0=self, 5=deterministic
+            static_argnums=(6, ),  # 0=self, 6=deterministic
             policy=jax.checkpoint_policies.nothing_saveable,
         )
         self.layers = nn.scan(
@@ -361,7 +372,7 @@ class Module(nn.Module):
                 "params": True,
                 "dropout": True
             },
-            in_axes=(0, nn.broadcast, nn.broadcast, nn.broadcast),  # 0=kv_cache, 1=positions, 2=mask, 3=decode
+            in_axes=(0, nn.broadcast, nn.broadcast, nn.broadcast, 0),
             length=self.configs[0].depth,
         )(
             configs=self.configs,
@@ -383,12 +394,22 @@ class Module(nn.Module):
         mask: at.Bool[at.Array, "b t s"],
         *,
         kv_cache: KVCache | None = None,
+        adaln_modulation: at.Float[at.Array, "l b d"] | None = None,
         deterministic: bool = True,
     ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]:
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
         mask = jnp.asarray(mask)[:, None, :, :]
 
-        embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, deterministic)
+        if adaln_modulation is None:
+            width = self.configs[1].width
+            reference = next(x for x in embedded if x is not None)
+            adaln_modulation = jnp.zeros(
+                (self.configs[0].depth, reference.shape[0], 4 * width),
+                dtype=reference.dtype,
+            )
+        embedded, kv_cache = self.layers(
+            embedded, kv_cache, positions, mask, deterministic, adaln_modulation,
+        )
 
         assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
 

@@ -1,5 +1,6 @@
 from collections.abc import Sequence
 import logging
+import os
 import pathlib
 from typing import Any, Literal, TypeAlias
 
@@ -40,12 +41,18 @@ class Policy(BasePolicy):
             self._history_conditioning_mode = model.history_conditioner.config.conditioning_mode
             if self._history_conditioning_mode == "film":
                 self._history_diagnostics = nnx_utils.module_jit(model.history_film_diagnostics)
+            elif self._history_conditioning_mode == "adaln":
+                self._history_diagnostics = nnx_utils.module_jit(model.history_adaln_diagnostics)
             else:
                 self._history_diagnostics = nnx_utils.module_jit(model.history_prefix_diagnostics)
             self._init_history_cache = model.init_history_cache
             self._history_encoder_type = model.history_conditioner.config.encoder_type
             self._history_max_length = model.history_conditioner.config.max_length
             self._history_cache = self._init_history_cache(1)
+            self._history_attention_debug = os.getenv("OPENPI_HISTORY_ATTENTION_DEBUG") == "1"
+            self._last_history_attention = None
+            if self._history_encoder_type == "transformer":
+                self._history_attention_diagnostics = nnx_utils.module_jit(model.history_attention_diagnostics)
             self._history_condition = None
             self._history_overflow = history_overflow
             self._history_steps = 0
@@ -100,6 +107,20 @@ class Policy(BasePolicy):
         self._history_condition = None
         self._history_steps = 0
         self._last_history_diagnostics = {}
+        self._last_history_attention = None
+
+    def _maybe_print_history_attention(self) -> None:
+        if not self._history_attention_debug or self._history_encoder_type != "transformer":
+            return
+        attention = np.asarray(self._history_attention_diagnostics(self._history_cache))
+        self._last_history_attention = attention
+        length = int(self._history_cache.length)
+        mean_by_frame = attention[:, :, :, :length].mean(axis=(0, 1, 2))
+        print(
+            "[history-attention] "
+            f"length={length} first_frame={mean_by_frame[0]:.6f} "
+            f"weights={np.array2string(mean_by_frame, precision=4, separator=',')}"
+        )
 
     @override
     def infer(self, obs: dict, *, update_history: bool = True) -> dict:  # type: ignore[misc]
@@ -117,6 +138,7 @@ class Policy(BasePolicy):
                 key: np.asarray(value[0]) for key, value in diagnostics.items()
             }
             self._last_history_diagnostics["history_length"] = self._history_steps
+            self._maybe_print_history_attention()
 
         self._rng, sample_rng = jax.random.split(self._rng)
         if self._history_enabled:
@@ -150,6 +172,11 @@ class Policy(BasePolicy):
         if not self._history_enabled:
             raise ValueError("History diagnostics require a history-enabled policy.")
         return self._last_history_diagnostics
+
+    def get_history_attention_diagnostics(self) -> np.ndarray:
+        if not self._history_enabled:
+            raise ValueError("History diagnostics require a history-enabled policy.")
+        return self._last_history_attention
 
     @property
     def metadata(self) -> dict[str, Any]:

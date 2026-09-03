@@ -41,7 +41,17 @@ def make_attn_mask(input_mask, mask_ar):
         it and false where it shares the same attention mask as the previous token.
     """
     mask_ar = jnp.broadcast_to(mask_ar, input_mask.shape)
-    cumsum = jnp.cumsum(mask_ar, axis=1)
+    # Attention masks are discrete bookkeeping values. Prevent autodiff from
+    # tracing their prefix sums into the training graph (which otherwise
+    # lowers to a large reduce-window JVP for every long history batch).
+    # ``jnp.cumsum`` lowers to a full-width ``reduce-window``.  For the long
+    # history batches this makes XLA spend tens of seconds constant-folding the
+    # discrete mask during the first multi-device executable compile.  The
+    # associative tree scan has identical integer semantics, but exposes a
+    # logarithmic-depth graph that compiles reliably on all replicas.
+    cumsum = jax.lax.associative_scan(
+        jnp.add, jax.lax.stop_gradient(mask_ar).astype(jnp.int32), axis=1
+    )
     attn_mask = cumsum[:, None, :] <= cumsum[:, :, None]
     valid_mask = input_mask[:, None, :] * input_mask[:, :, None]
     return jnp.logical_and(attn_mask, valid_mask)
@@ -127,6 +137,7 @@ class Pi0Config(_model.BaseModelConfig):
                 trainable = nnx.Any(
                     nnx_utils.PathRegex(".*history_conditioner.*"),
                     nnx_utils.PathRegex(".*history_modulation.*"),
+                    nnx_utils.PathRegex(".*history_adaln.*"),
                     nnx_utils.PathRegex(".*history_token_proj.*"),
                     nnx_utils.PathRegex(".*llm.*_1.*lora.*"),
                 )
@@ -134,6 +145,7 @@ class Pi0Config(_model.BaseModelConfig):
                 trainable = nnx.Any(
                     nnx_utils.PathRegex(".*history_conditioner.*"),
                     nnx_utils.PathRegex(".*history_modulation.*"),
+                    nnx_utils.PathRegex(".*history_adaln.*"),
                     nnx_utils.PathRegex(".*history_token_proj.*"),
                     nnx_utils.PathRegex(".*llm.*lora.*"),
                 )
@@ -141,6 +153,7 @@ class Pi0Config(_model.BaseModelConfig):
                 trainable = nnx.Any(
                     nnx_utils.PathRegex(".*history_conditioner.*"),
                     nnx_utils.PathRegex(".*history_modulation.*"),
+                    nnx_utils.PathRegex(".*history_adaln.*"),
                     nnx_utils.PathRegex(".*history_token_proj.*"),
                     nnx_utils.PathRegex(".*llm.*lora.*"),
                     nnx_utils.PathRegex(".*PaliGemma/img.*"),
@@ -149,6 +162,7 @@ class Pi0Config(_model.BaseModelConfig):
                 trainable = nnx.Any(
                     nnx_utils.PathRegex(".*history_conditioner.*"),
                     nnx_utils.PathRegex(".*history_modulation.*"),
+                    nnx_utils.PathRegex(".*history_adaln.*"),
                     nnx_utils.PathRegex(".*history_token_proj.*"),
                     nnx_utils.PathRegex(".*llm.*lora.*"),
                     nnx_utils.PathRegex(
@@ -232,6 +246,9 @@ class Pi0(_model.BaseModel):
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
         self.history_conditioner = None
         self.history_modulation = None
+        self.history_adaln = None
+        self.history_adaln_layer_scale = None
+        self.history_adaln_layer_bias = None
         self.history_token_proj = None
         if config.history is not None:
             self.history_conditioner = _history.HistoryConditioner(config.history, rngs=rngs)
@@ -242,6 +259,20 @@ class Pi0(_model.BaseModel):
                     kernel_init=jax.nn.initializers.zeros,
                     bias_init=jax.nn.initializers.zeros,
                     rngs=rngs,
+                )
+            elif config.history.conditioning_mode == "adaln":
+                self.history_adaln = nnx.Linear(
+                    config.history.condition_dim,
+                    4 * action_expert_config.width,
+                    kernel_init=jax.nn.initializers.zeros,
+                    bias_init=jax.nn.initializers.zeros,
+                    rngs=rngs,
+                )
+                self.history_adaln_layer_scale = nnx.Param(
+                    jnp.ones((action_expert_config.depth, 4 * action_expert_config.width))
+                )
+                self.history_adaln_layer_bias = nnx.Param(
+                    jnp.zeros((action_expert_config.depth, 4 * action_expert_config.width))
                 )
             elif config.history.conditioning_mode == "prefix_tokens":
                 self.history_token_proj = nnx.Linear(
@@ -283,7 +314,7 @@ class Pi0(_model.BaseModel):
         conditions = self.history_conditioner.gather_anchor_conditions(
             visual_features, states, valid_mask, anchor_indices, train=train
         )
-        if self.history_conditioner.config.conditioning_mode == "film":
+        if self.history_conditioner.config.conditioning_mode in ("film", "adaln"):
             return conditions.reshape((-1, conditions.shape[-1]))
         if self.history_conditioner.config.conditioning_mode == "single_token":
             return conditions.reshape((-1, 1, conditions.shape[-1]))
@@ -326,6 +357,11 @@ class Pi0(_model.BaseModel):
             raise ValueError("History conditioning is not enabled for this Pi0 model.")
         return self.history_conditioner.init_cache(batch_size)
 
+    def history_attention_diagnostics(self, cache) -> jax.Array:
+        if self.history_conditioner is None:
+            raise ValueError("History attention diagnostics require a history-enabled policy.")
+        return self.history_conditioner.attention_diagnostics(cache)
+
     def history_film_diagnostics(self, history_condition: jax.Array) -> dict[str, jax.Array]:
         if self.history_modulation is None:
             raise ValueError("History conditioning is not enabled for this Pi0 model.")
@@ -340,6 +376,32 @@ class Pi0(_model.BaseModel):
             "scale_dynamic": scale - zero_scale,
             "shift_dynamic": shift - zero_shift,
         }
+
+    def history_adaln_modulations(self, history_condition: jax.Array) -> jax.Array:
+        if self.history_adaln is None:
+            raise ValueError("AdaLN history conditioning is not enabled for this Pi0 model.")
+        base = self.history_adaln(history_condition)
+        return base[None, ...] * self.history_adaln_layer_scale.value[:, None, :] + self.history_adaln_layer_bias.value[:, None, :]
+
+    def history_adaln_diagnostics(self, history_condition: jax.Array) -> dict[str, jax.Array]:
+        modulation = self.history_adaln_modulations(history_condition)
+        attn_scale, attn_shift, mlp_scale, mlp_shift = jnp.split(modulation, 4, axis=-1)
+        return {
+            "history_condition": history_condition,
+            "attn_scale": attn_scale,
+            "attn_shift": attn_shift,
+            "mlp_scale": mlp_scale,
+            "mlp_shift": mlp_shift,
+            "attn_scale_dynamic": attn_scale,
+            "attn_shift_dynamic": attn_shift,
+            "mlp_scale_dynamic": mlp_scale,
+            "mlp_shift_dynamic": mlp_shift,
+        }
+
+    def _history_adaln_for_llm(self, history_condition):
+        if self.history_adaln is None or history_condition is None:
+            return None
+        return self.history_adaln_modulations(history_condition)
 
     def history_prefix_diagnostics(self, history_condition: jax.Array) -> dict[str, jax.Array]:
         if self.history_token_proj is None:
@@ -400,7 +462,7 @@ class Pi0(_model.BaseModel):
             # image tokens attend to each other
             ar_mask += [False] * image_tokens.shape[1]
 
-        if history_condition is not None:
+        if history_condition is not None and self.history_conditioner.config.conditioning_mode == "single_token":
             if self.history_conditioner is None or (
                 self.history_conditioner.config.conditioning_mode != "single_token"
             ):
@@ -454,7 +516,7 @@ class Pi0(_model.BaseModel):
         action_time_tokens = self.action_time_mlp_in(action_time_tokens)
         action_time_tokens = nnx.swish(action_time_tokens)
         action_time_tokens = self.action_time_mlp_out(action_time_tokens)
-        if history_condition is not None:
+        if history_condition is not None and self.history_conditioner.config.conditioning_mode == "film":
             if self.history_modulation is None:
                 raise ValueError("Received a history condition for a Pi0 model without history conditioning.")
             scale, shift = jnp.split(self.history_modulation(history_condition), 2, axis=-1)
@@ -530,10 +592,21 @@ class Pi0(_model.BaseModel):
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
         attn_mask = make_attn_mask(input_mask, ar_mask)
-        positions = jnp.cumsum(input_mask, axis=1) - 1
-        (prefix_out, suffix_out), _ = self.PaliGemma.llm([prefix_tokens, suffix_tokens],
-                                                         mask=attn_mask,
-                                                         positions=positions)
+        positions = jax.lax.associative_scan(
+            jnp.add, jax.lax.stop_gradient(input_mask).astype(jnp.int32), axis=1
+        ) - 1
+        llm_adaln = (
+            self._history_adaln_for_llm(history_condition)
+            if self.history_conditioner is not None
+            and self.history_conditioner.config.conditioning_mode == "adaln"
+            else None
+        )
+        (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+            [prefix_tokens, suffix_tokens],
+            mask=attn_mask,
+            positions=positions,
+            adaln_modulation=llm_adaln,
+        )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon:])
 
         return jnp.mean(jnp.square(v_t - u_t), axis=-1)
@@ -597,7 +670,8 @@ class Pi0(_model.BaseModel):
         prefill_attn_mask = make_attn_mask(prefill_mask, prefill_ar_mask)
         positions = jnp.cumsum(prefill_mask, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm(
-            [prefix_tokens, history_tokens], mask=prefill_attn_mask, positions=positions
+            [prefix_tokens, history_tokens], mask=prefill_attn_mask, positions=positions,
+            adaln_modulation=None,
         )
 
         def step(carry):
@@ -607,6 +681,12 @@ class Pi0(_model.BaseModel):
                 x_t,
                 jnp.broadcast_to(time, batch_size),
                 history_condition=None if prefix_mode or single_token_mode else history_condition,
+            )
+            llm_adaln = (
+                self._history_adaln_for_llm(history_condition)
+                if self.history_conditioner is not None
+                and self.history_conditioner.config.conditioning_mode == "adaln"
+                else None
             )
             # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
             # other
@@ -628,7 +708,8 @@ class Pi0(_model.BaseModel):
             (prefix_out, suffix_out), _ = self.PaliGemma.llm([None, suffix_tokens],
                                                              mask=full_attn_mask,
                                                              positions=positions,
-                                                             kv_cache=kv_cache)
+                                                             kv_cache=kv_cache,
+                                                             adaln_modulation=llm_adaln)
             assert prefix_out is None
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon:])
 

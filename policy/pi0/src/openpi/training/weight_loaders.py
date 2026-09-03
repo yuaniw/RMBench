@@ -84,7 +84,7 @@ class PretrainedHistoryCheckpointWeightLoader(WeightLoader):
         return _merge_params(
             loaded_params,
             params,
-            missing_regex=r".*(lora|history_conditioner|history_modulation|history_token_proj).*",
+            missing_regex=r".*(lora|history_conditioner|history_modulation|history_adaln|history_token_proj).*",
         )
 
 

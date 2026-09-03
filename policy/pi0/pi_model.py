@@ -239,10 +239,31 @@ class PI0:
         self.history_film_records = []
         self.history_film_episode += 1
 
+    def _save_history_adaln_diagnostics(self):
+        if not self.history_film_records:
+            return
+        episode_dir = self.history_film_dir / f"episode_{self.history_film_episode:03d}"
+        episode_dir.mkdir(parents=True, exist_ok=False)
+        records = self.history_film_records
+        np.savez_compressed(
+            episode_dir / "history_adaln.npz",
+            rollout_step=np.asarray([r["rollout_step"] for r in records]),
+            history_length=np.asarray([r["history_length"] for r in records]),
+            history_condition=np.stack([r["history_condition"] for r in records]),
+            attn_scale=np.stack([r["attn_scale"] for r in records]),
+            attn_shift=np.stack([r["attn_shift"] for r in records]),
+            mlp_scale=np.stack([r["mlp_scale"] for r in records]),
+            mlp_shift=np.stack([r["mlp_shift"] for r in records]),
+        )
+        self.history_film_records = []
+        self.history_film_episode += 1
+
     def reset_obsrvationwindows(self):
         if self.history_enabled:
             if self.history_conditioning_mode == "film":
                 self._save_history_film_diagnostics()
+            elif self.history_conditioning_mode == "adaln":
+                self._save_history_adaln_diagnostics()
             else:
                 self._save_history_prefix_diagnostics()
         self.instruction = None

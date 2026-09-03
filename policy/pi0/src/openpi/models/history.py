@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 
 HistoryEncoderType = Literal["transformer", "mamba"]
-HistoryConditioningMode = Literal["film", "prefix_tokens", "single_token"]
+HistoryConditioningMode = Literal["film", "adaln", "prefix_tokens", "single_token"]
 HistoryPositionEncoding = Literal["learned_absolute", "rope"]
 HistoryPositionOverflow = Literal["cycle", "clamp"]
 HistoryRematPolicy = Literal["none", "nothing_saveable"]
@@ -43,6 +43,13 @@ class HistoryEncoderConfig:
     mamba_dt_max: float = 0.1
     mamba_dt_init_floor: float = 1e-4
     mamba_dt_scale: float = 1.0
+    anchor_frame: bool = False
+    anchor_only: bool = False
+    anchor_num_layers: int = 2
+
+    @property
+    def condition_dim(self) -> int:
+        return self.d_model if self.anchor_only else (2 * self.d_model if self.anchor_frame else self.d_model)
 
 
 class TransformerLayerCache(NamedTuple):
@@ -56,6 +63,7 @@ class TransformerHistoryCache(NamedTuple):
     valid_mask: jax.Array
     encoded_outputs: jax.Array
     length: jax.Array
+    anchor_tokens: jax.Array | None = None
 
 
 def grow_transformer_history_cache(
@@ -79,6 +87,7 @@ def grow_transformer_history_cache(
         valid_mask=jnp.pad(cache.valid_mask, ((0, 0), (0, padding))),
         encoded_outputs=jnp.pad(cache.encoded_outputs, ((0, 0), (0, padding), (0, 0))),
         length=cache.length,
+        anchor_tokens=cache.anchor_tokens,
     )
 
 
@@ -89,6 +98,8 @@ class MambaLayerCache(NamedTuple):
 
 class MambaHistoryCache(NamedTuple):
     layers: tuple[MambaLayerCache, ...]
+    length: jax.Array
+    anchor_tokens: jax.Array | None = None
 
 
 class SpatialAttentionPool(nnx.Module):
@@ -96,10 +107,47 @@ class SpatialAttentionPool(nnx.Module):
         self.feature_proj = nnx.Linear(feature_dim, d_model, use_bias=False, rngs=rngs)
         self.score = nnx.Linear(d_model, 1, use_bias=False, rngs=rngs)
 
+    def project(self, features: jax.Array) -> jax.Array:
+        return jnp.tanh(self.feature_proj(features))
+
     def __call__(self, features: jax.Array) -> jax.Array:
-        projected = jnp.tanh(self.feature_proj(features))
+        projected = self.project(features)
         weights = jax.nn.softmax(self.score(projected), axis=-2)
         return jnp.sum(weights * projected, axis=-2)
+
+
+class AnchorCrossAttentionBlock(nnx.Module):
+    def __init__(self, config: HistoryEncoderConfig, *, rngs: nnx.Rngs):
+        if config.d_model % config.num_heads != 0:
+            raise ValueError("d_model must be divisible by num_heads.")
+        self.num_heads = config.num_heads
+        self.head_dim = config.d_model // config.num_heads
+        self.query_norm = nnx.LayerNorm(config.d_model, rngs=rngs)
+        self.kv_norm = nnx.LayerNorm(config.d_model, rngs=rngs)
+        self.query_proj = nnx.Linear(config.d_model, config.d_model, use_bias=False, rngs=rngs)
+        self.key_proj = nnx.Linear(config.d_model, config.d_model, use_bias=False, rngs=rngs)
+        self.value_proj = nnx.Linear(config.d_model, config.d_model, use_bias=False, rngs=rngs)
+        self.out_proj = nnx.Linear(config.d_model, config.d_model, use_bias=False, rngs=rngs)
+        self.mlp_norm = nnx.LayerNorm(config.d_model, rngs=rngs)
+        self.mlp_in = nnx.Linear(config.d_model, config.mlp_dim, rngs=rngs)
+        self.mlp_out = nnx.Linear(config.mlp_dim, config.d_model, rngs=rngs)
+
+    def __call__(self, query: jax.Array, key_value: jax.Array) -> jax.Array:
+        q = self.query_proj(self.query_norm(query)).reshape(
+            query.shape[0], query.shape[1], self.num_heads, self.head_dim
+        )
+        source = self.kv_norm(key_value)
+        k = self.key_proj(source).reshape(
+            source.shape[0], source.shape[1], self.num_heads, self.head_dim
+        )
+        v = self.value_proj(source).reshape(
+            source.shape[0], source.shape[1], self.num_heads, self.head_dim
+        )
+        scores = jnp.einsum("bqhd,bkhd->bhqk", q, k) * self.head_dim**-0.5
+        weights = jax.nn.softmax(scores, axis=-1)
+        attended = jnp.einsum("bhqk,bkhd->bqhd", weights, v).reshape(query.shape)
+        x = query + self.out_proj(attended)
+        return x + self.mlp_out(nnx.gelu(self.mlp_in(self.mlp_norm(x))))
 
 
 class HistoryInputAdapter(nnx.Module):
@@ -220,7 +268,7 @@ def _call_transformer_block(
     x: jax.Array,
     attention_mask: jax.Array,
     positions: jax.Array | None,
-    train: bool,
+    train: bool,  # noqa: FBT001
 ) -> jax.Array:
     return block(x, attention_mask, positions, train=train)
 
@@ -311,6 +359,7 @@ class CausalTransformerHistoryEncoder(nnx.Module):
                 (batch_size, self.config.max_length, self.config.d_model), dtype=jnp.float32
             ),
             length=jnp.zeros((), dtype=jnp.int32),
+            anchor_tokens=None,
         )
 
     def rebuild_cache(self, tokens: jax.Array, valid_mask: jax.Array) -> TransformerHistoryCache:
@@ -372,6 +421,7 @@ class CausalTransformerHistoryEncoder(nnx.Module):
                 valid_mask=valid_mask,
                 encoded_outputs=encoded_outputs,
                 length=index + 1,
+                anchor_tokens=current_cache.anchor_tokens,
             ), output
 
         def rebuild_sliding_window(
@@ -380,6 +430,7 @@ class CausalTransformerHistoryEncoder(nnx.Module):
             window_tokens = jnp.concatenate([full_cache.input_tokens[:, 1:], token[:, None]], axis=1)
             window_valid = jnp.concatenate([full_cache.valid_mask[:, 1:], valid[:, None]], axis=1)
             rebuilt_cache = self.rebuild_cache(window_tokens, window_valid)
+            rebuilt_cache = rebuilt_cache._replace(anchor_tokens=full_cache.anchor_tokens)
             return rebuilt_cache.encoded_outputs[:, -1], rebuilt_cache
 
         def append_to_cache(
@@ -395,6 +446,38 @@ class CausalTransformerHistoryEncoder(nnx.Module):
             append_to_cache,
             cache,
         )
+
+    def attention_diagnostics(self, cache: TransformerHistoryCache) -> jax.Array:
+        """Compute temporal attention for the latest history token.
+
+        Returns ``[num_layers, batch, num_heads, capacity]``. Invalid/padded
+        positions are masked to zero. This replay path is only intended for
+        debugging; normal recurrent inference does not materialize attention.
+        """
+        capacity = cache.input_tokens.shape[1]
+        index = cache.length - 1
+        positions = jnp.arange(capacity, dtype=jnp.int32)
+        valid_mask = cache.valid_mask
+        if self.config.position_encoding == "learned_absolute":
+            x = cache.input_tokens + self._position_embeddings(capacity)[None]
+        else:
+            x = cache.input_tokens
+        causal = jnp.tril(jnp.ones((capacity, capacity), dtype=jnp.bool_))
+        attention_mask = causal[None, None] & valid_mask[:, None, None, :]
+        diagnostics = []
+        for layer_index in range(self.config.num_layers):
+            block = self.blocks[f"layer_{layer_index}"]
+            normalized = block.attn_norm(x)
+            query, _, _ = block.project_qkv(normalized, positions)
+            query_last = query[:, index]
+            keys = cache.layers[layer_index].keys
+            scores = jnp.einsum("bhd,bshd->bhs", query_last, keys) * block.head_dim**-0.5
+            scores = jnp.where(valid_mask[:, None, :], scores, jnp.finfo(scores.dtype).min)
+            layer_weights = jax.nn.softmax(scores, axis=-1)
+            layer_weights = jnp.where(valid_mask[:, None, :], layer_weights, 0)
+            diagnostics.append(layer_weights)
+            x = block(x, attention_mask, positions if self.config.position_encoding == "rope" else None, train=False)
+        return jnp.stack(diagnostics, axis=0)
 
 
 class SelectiveSSMLayer(nnx.Module):
@@ -487,7 +570,9 @@ class RecurrentMambaHistoryEncoder(nnx.Module):
         return MambaHistoryCache(
             layers=tuple(
                 self.layers[f"layer_{index}"].init_cache(batch_size) for index in range(self.config.num_layers)
-            )
+            ),
+            length=jnp.zeros((), dtype=jnp.int32),
+            anchor_tokens=None,
         )
 
     def step(
@@ -500,7 +585,9 @@ class RecurrentMambaHistoryEncoder(nnx.Module):
             x, new_cache = layer.step(x, valid, layer_cache)
             new_layers.append(new_cache)
         x = self.final_norm(x)
-        return jnp.where(valid[:, None], x, 0), MambaHistoryCache(layers=tuple(new_layers))
+        return jnp.where(valid[:, None], x, 0), MambaHistoryCache(
+            layers=tuple(new_layers), length=cache.length + 1, anchor_tokens=cache.anchor_tokens
+        )
 
     def encode_sequence(self, tokens: jax.Array, valid_mask: jax.Array, *, train: bool = False) -> jax.Array:
         del train
@@ -566,7 +653,19 @@ class LearnedQueryHistoryResampler(nnx.Module):
 class HistoryConditioner(nnx.Module):
     def __init__(self, config: HistoryEncoderConfig, *, rngs: nnx.Rngs):
         self.config = config
+        if config.anchor_frame and config.conditioning_mode != "adaln":
+            raise ValueError("Anchor-frame conditioning currently requires AdaLN mode.")
+        if config.anchor_only and not config.anchor_frame:
+            raise ValueError("anchor_only requires anchor_frame to be enabled.")
+        if config.anchor_frame and config.anchor_num_layers <= 0:
+            raise ValueError("anchor_num_layers must be positive when anchor conditioning is enabled.")
         self.input_adapter = HistoryInputAdapter(config, rngs=rngs)
+        self.anchor_attention = None
+        if config.anchor_frame:
+            self.anchor_attention = nnx.Dict(
+                {f"layer_{index}": AnchorCrossAttentionBlock(config, rngs=rngs)
+                 for index in range(config.anchor_num_layers)}
+            )
         if config.encoder_type == "transformer":
             self.encoder = CausalTransformerHistoryEncoder(config, rngs=rngs)
         elif config.encoder_type == "mamba":
@@ -599,12 +698,50 @@ class HistoryConditioner(nnx.Module):
         return self.encoder.encode_sequence(tokens, valid_mask, train=train)
 
     def init_cache(self, batch_size: int):
-        return self.encoder.init_cache(batch_size)
+        cache = self.encoder.init_cache(batch_size)
+        if self.config.anchor_frame:
+            anchor_tokens = jnp.zeros(
+                (batch_size, self.config.spatial_tokens, self.config.d_model), dtype=jnp.float32
+            )
+            cache = cache._replace(anchor_tokens=anchor_tokens)
+        return cache
+
+    def _anchor_condition(self, visual_features: jax.Array, anchor_indices: jax.Array) -> jax.Array:
+        projected = self.input_adapter.spatial_pool.project(visual_features)
+        batch_size, anchor_count = anchor_indices.shape
+        anchor_tokens = jnp.broadcast_to(projected[:, 0, None], (batch_size, anchor_count, projected.shape[2], projected.shape[3]))
+        current = jax.vmap(lambda values, indices: values[indices])(projected, anchor_indices)
+        anchor_tokens = anchor_tokens.reshape((-1, anchor_tokens.shape[-2], anchor_tokens.shape[-1]))
+        current = current.reshape((-1, current.shape[-2], current.shape[-1]))
+        weights = jax.nn.softmax(self.input_adapter.spatial_pool.score(current), axis=-2)
+        query = jnp.sum(weights * current, axis=-2, keepdims=True)
+        for index in range(self.config.anchor_num_layers):
+            query = self.anchor_attention[f"layer_{index}"](query, anchor_tokens)
+        return query.squeeze(axis=1).reshape((batch_size, anchor_count, -1))
+
+    def attention_diagnostics(self, cache):
+        if self.config.encoder_type != "transformer":
+            raise ValueError("Attention diagnostics require the Transformer history encoder.")
+        return self.encoder.attention_diagnostics(cache)
 
     def step(self, visual_features: jax.Array, states: jax.Array, valid: jax.Array, cache):
+        was_empty = cache.length == 0
         token = self.input_adapter(visual_features, states)
         output, cache = self.encoder.step(token, valid, cache)
-        if self.config.conditioning_mode in ("film", "single_token"):
+        if self.config.anchor_frame:
+            projected = self.input_adapter.spatial_pool.project(visual_features)
+            first_valid = was_empty & valid[:, None, None]
+            anchor_tokens = jnp.where(first_valid, projected, cache.anchor_tokens)
+            cache = cache._replace(anchor_tokens=anchor_tokens)
+            weights = jax.nn.softmax(self.input_adapter.spatial_pool.score(projected), axis=-2)
+            query = jnp.sum(weights * projected, axis=-2, keepdims=True)
+            for index in range(self.config.anchor_num_layers):
+                query = self.anchor_attention[f"layer_{index}"](query, cache.anchor_tokens)
+            output = jnp.concatenate([output, query.squeeze(axis=1)], axis=-1)
+            if self.config.anchor_only:
+                output = query.squeeze(axis=1)
+            output = jnp.where(valid[:, None], output, 0)
+        if self.config.conditioning_mode in ("film", "adaln", "single_token"):
             return output, cache
         anchor_indices = jnp.full((token.shape[0], 1), cache.length - 1, dtype=jnp.int32)
         condition_tokens = self.resampler(cache.encoded_outputs, cache.valid_mask, anchor_indices)
@@ -620,8 +757,12 @@ class HistoryConditioner(nnx.Module):
         train: bool = False,
     ) -> jax.Array:
         sequence = self.encode_sequence(visual_features, states, valid_mask, train=train)
-        if self.config.conditioning_mode in ("film", "single_token"):
-            return jax.vmap(lambda encoded, indices: encoded[indices])(sequence, anchor_indices)
+        if self.config.conditioning_mode in ("film", "adaln", "single_token"):
+            conditions = jax.vmap(lambda encoded, indices: encoded[indices])(sequence, anchor_indices)
+            if self.config.anchor_frame:
+                anchor = self._anchor_condition(visual_features, anchor_indices)
+                conditions = anchor if self.config.anchor_only else jnp.concatenate([conditions, anchor], axis=-1)
+            return conditions
         return self.resampler(sequence, valid_mask, anchor_indices)
 
     def gather_single_token_conditions(

@@ -393,6 +393,18 @@ class HistoryDataConfig:
     strict_past_probability: float = 0.0
     history_action_loss_weight: float = 0.0
     state_action_loss_weight: float = 0.0
+    # Keep decoded episode tensors in host memory after their first access.
+    # This avoids repeatedly reading the same state/action arrays and history
+    # feature files on every pass through the episode stream.
+    cache_in_memory: bool = True
+    # Limit the small per-frame cache used for current-observation transforms.
+    # None keeps every transformed frame; a finite value bounds host memory.
+    max_cached_frames: int | None = 512
+    # Optional RoboTwin task names to mix during history training.  When set,
+    # the history loader creates one episode dataset per task and samples them
+    # in a shuffled round-robin stream.  An empty tuple keeps the original
+    # single-repository behavior.
+    tasks: tuple[str, ...] = ()
 
 
 # Use `get_config` if you need to get a config by name in your code.
@@ -681,7 +693,7 @@ _CONFIGS.append(
             pretrained_history_base.history_data,
             cache_dir="./history_cache/put_back_block-demo_clean-50-pi0-base",
             source_checkpoint_params=pretrained_pi0_params,
-            anchors_per_episode=32,
+            anchors_per_episode=48,
             gradient_accumulate_episodes=1,
         ),
         freeze_filter=pretrained_history_model.get_freeze_filter(),
@@ -922,6 +934,9 @@ ROBOTWIN_HISTORY_TASKS = (
     "press_button",
 )
 ROBOTWIN_HISTORY_ARTIFACT_VERSION = "history-rope-v1"
+ROBOTWIN_HISTORY_ADALN_ARTIFACT_VERSION = "history-adaln-v1"
+ROBOTWIN_HISTORY_ANCHOR_ADALN_ARTIFACT_VERSION = "history-anchor-adaln-v1"
+ROBOTWIN_HISTORY_ANCHOR_ONLY_ARTIFACT_VERSION = "history-anchor-only-v1"
 ROBOTWIN_HISTORY_ASSETS_DIR = "./assets/pi0_base_aloha_robotwin_history-rope-v1"
 
 
@@ -945,6 +960,32 @@ def robotwin_history_train_config_name(task: str) -> str:
         f"{task}_{ROBOTWIN_HISTORY_ARTIFACT_VERSION}"
     )
 
+def robotwin_history_adaln_train_config_name(task: str) -> str:
+    if task not in ROBOTWIN_HISTORY_TASKS:
+        raise ValueError(f"Unsupported RoboTwin history task: {task}")
+    return (
+        "pi0_base_aloha_robotwin_lora_history_transformer_rope_adaln_vlm_lora_30k_1gpu_"
+        f"{task}_{ROBOTWIN_HISTORY_ADALN_ARTIFACT_VERSION}"
+    )
+
+
+def robotwin_history_anchor_adaln_train_config_name(task: str) -> str:
+    if task not in ROBOTWIN_HISTORY_TASKS:
+        raise ValueError(f"Unsupported RoboTwin history task: {task}")
+    return (
+        "pi0_base_aloha_robotwin_lora_history_transformer_rope_anchor_adaln_vlm_lora_30k_1gpu_"
+        f"{task}_{ROBOTWIN_HISTORY_ANCHOR_ADALN_ARTIFACT_VERSION}"
+    )
+
+
+def robotwin_history_anchor_only_train_config_name(task: str) -> str:
+    if task not in ROBOTWIN_HISTORY_TASKS:
+        raise ValueError(f"Unsupported RoboTwin history task: {task}")
+    return (
+        "pi0_base_aloha_robotwin_lora_history_transformer_rope_anchor_only_adaln_vlm_lora_30k_1gpu_"
+        f"{task}_{ROBOTWIN_HISTORY_ANCHOR_ONLY_ARTIFACT_VERSION}"
+    )
+
 
 def _robotwin_history_data_config(task: str) -> LeRobotAlohaDataConfig:
     repo_id = robotwin_history_repo_id(task)
@@ -958,12 +999,38 @@ def _robotwin_history_data_config(task: str) -> LeRobotAlohaDataConfig:
     )
 
 
+def robotwin_history_data_config(task: str) -> LeRobotAlohaDataConfig:
+    return _robotwin_history_data_config(task)
+
+
 robotwin_history_rope_model = dataclasses.replace(
     pretrained_vlm_lora_history_model,
     history=dataclasses.replace(
         pretrained_vlm_lora_history_model.history,
         position_encoding="rope",
         remat_policy="nothing_saveable",
+    ),
+)
+robotwin_history_adaln_model = dataclasses.replace(
+    robotwin_history_rope_model,
+    history=dataclasses.replace(
+        robotwin_history_rope_model.history,
+        conditioning_mode="adaln",
+    ),
+)
+robotwin_history_anchor_adaln_model = dataclasses.replace(
+    robotwin_history_adaln_model,
+    history=dataclasses.replace(
+        robotwin_history_adaln_model.history,
+        anchor_frame=True,
+        anchor_num_layers=2,
+    ),
+)
+robotwin_history_anchor_only_model = dataclasses.replace(
+    robotwin_history_anchor_adaln_model,
+    history=dataclasses.replace(
+        robotwin_history_anchor_adaln_model.history,
+        anchor_only=True,
     ),
 )
 
@@ -990,6 +1057,31 @@ def robotwin_history_absolute_train_config_name(task: str) -> str:
         f"{task}_history-absolute-v1"
     )
 
+
+ROBOTWIN_MULTITASK_HISTORY_TASKS = (
+    "put_back_block",
+    "rearrange_blocks",
+    "battery_try",
+)
+ROBOTWIN_MULTITASK_HISTORY_CONFIG_NAME = (
+    "pi0_base_aloha_robotwin_lora_history_transformer_absolute_vlm_lora_"
+    "30k_3gpu_batch48_put_back_rearrange_battery_history-absolute-v1"
+)
+ROBOTWIN_MULTITASK_HISTORY_1GPU_CONFIG_NAME = (
+    "pi0_base_aloha_robotwin_lora_history_transformer_absolute_vlm_lora_"
+    "30k_1gpu_batch32_put_back_rearrange_battery_history-absolute-v1"
+)
+ROBOTWIN_FOURTASK_HISTORY_4GPU_CONFIG_NAME = (
+    "pi0_base_aloha_robotwin_lora_history_transformer_rope_vlm_lora_"
+    "30k_4gpu_dp_cover_press_putback_rearrange_history-rope-v1"
+)
+ROBOTWIN_FOURTASK_HISTORY_TASKS = (
+    "cover_blocks",
+    "press_button",
+    "put_back_block",
+    "rearrange_blocks",
+)
+
 for robotwin_history_task in ROBOTWIN_HISTORY_TASKS:
     robotwin_data = _robotwin_history_data_config(robotwin_history_task)
     robotwin_repo_id = robotwin_history_repo_id(robotwin_history_task)
@@ -1007,6 +1099,86 @@ for robotwin_history_task in ROBOTWIN_HISTORY_TASKS:
             fsdp_devices=1,
         )
     )
+    if robotwin_history_task in ("observe_and_pickup", "cover_blocks"):
+        _CONFIGS.append(
+            dataclasses.replace(
+                pretrained_history_base,
+                name=robotwin_history_anchor_only_train_config_name(robotwin_history_task),
+                model=robotwin_history_anchor_only_model,
+                data=robotwin_data,
+                history_data=dataclasses.replace(
+                    pretrained_history_base.history_data,
+                    cache_dir=f"./history_cache/{robotwin_repo_id}-pi0-base",
+                    source_checkpoint_params=pretrained_pi0_params,
+                    max_episode_steps=None,
+                    episode_length_bucket_size=128,
+                    anchors_per_episode=32,
+                    gradient_accumulate_episodes=1,
+                ),
+                freeze_filter=robotwin_history_anchor_only_model.get_freeze_filter(),
+                weight_loader=weight_loaders.PretrainedHistoryCheckpointWeightLoader(pretrained_pi0_params),
+                lr_schedule=_optimizer.CosineDecaySchedule(
+                    peak_lr=2.5e-5, decay_steps=30_000, decay_lr=2.5e-6
+                ),
+                batch_size=1,
+                num_workers=0,
+                num_train_steps=30_000,
+                fsdp_devices=1,
+            )
+        )
+    _CONFIGS.append(
+        dataclasses.replace(
+            pretrained_history_base,
+            name=robotwin_history_anchor_adaln_train_config_name(robotwin_history_task),
+            model=robotwin_history_anchor_adaln_model,
+            data=robotwin_data,
+            history_data=dataclasses.replace(
+                pretrained_history_base.history_data,
+                cache_dir=f"./history_cache/{robotwin_repo_id}-pi0-base",
+                source_checkpoint_params=pretrained_pi0_params,
+                max_episode_steps=None,
+                episode_length_bucket_size=128,
+                anchors_per_episode=32,
+                gradient_accumulate_episodes=1,
+            ),
+            freeze_filter=robotwin_history_anchor_adaln_model.get_freeze_filter(),
+            weight_loader=weight_loaders.PretrainedHistoryCheckpointWeightLoader(pretrained_pi0_params),
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                peak_lr=2.5e-5, decay_steps=30_000, decay_lr=2.5e-6
+            ),
+            batch_size=1,
+            num_workers=0,
+            num_train_steps=30_000,
+            fsdp_devices=1,
+        )
+    )
+    _CONFIGS.append(
+        dataclasses.replace(
+            pretrained_history_base,
+            name=robotwin_history_adaln_train_config_name(robotwin_history_task),
+            model=robotwin_history_adaln_model,
+            data=robotwin_data,
+            history_data=dataclasses.replace(
+                pretrained_history_base.history_data,
+                cache_dir=f"./history_cache/{robotwin_repo_id}-pi0-base",
+                source_checkpoint_params=pretrained_pi0_params,
+                max_episode_steps=None,
+                episode_length_bucket_size=128,
+                anchors_per_episode=32,
+                gradient_accumulate_episodes=1,
+            ),
+            freeze_filter=robotwin_history_adaln_model.get_freeze_filter(),
+            weight_loader=weight_loaders.PretrainedHistoryCheckpointWeightLoader(pretrained_pi0_params),
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                peak_lr=2.5e-5, decay_steps=30_000, decay_lr=2.5e-6
+            ),
+            batch_size=1,
+            num_workers=0,
+            num_train_steps=30_000,
+            fsdp_devices=1,
+        )
+    )
+
     _CONFIGS.append(
         dataclasses.replace(
             pretrained_history_base,
@@ -1063,6 +1235,75 @@ for robotwin_history_task in ROBOTWIN_HISTORY_TASKS:
             fsdp_devices=1,
         )
     )
+
+# Three-task history training. The loader keeps one complete episode per
+# batch; 48 anchors are split across 3 GPUs (16/GPU), with no gradient
+# accumulation. Thus each optimizer update directly uses 48 anchors.
+_CONFIGS.append(
+    dataclasses.replace(
+        pretrained_history_base,
+        name=ROBOTWIN_MULTITASK_HISTORY_CONFIG_NAME,
+        model=robotwin_history_absolute_model,
+        data=_robotwin_history_data_config("put_back_block"),
+        history_data=dataclasses.replace(
+            pretrained_history_base.history_data,
+            tasks=ROBOTWIN_MULTITASK_HISTORY_TASKS,
+            cache_dir=None,
+            source_checkpoint_params=pretrained_pi0_params,
+            max_episode_steps=None,
+            episode_length_bucket_size=128,
+            anchors_per_episode=48,
+            gradient_accumulate_episodes=1,
+        ),
+        freeze_filter=robotwin_history_absolute_model.get_freeze_filter(),
+        weight_loader=weight_loaders.PretrainedHistoryCheckpointWeightLoader(
+            pretrained_pi0_params
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+            decay_lr=2.5e-6,
+        ),
+        batch_size=1,
+        num_workers=0,
+        num_train_steps=30_000,
+        fsdp_devices=3,
+    )
+)
+
+# Four-task throughput-oriented training.  Each optimizer step loads four
+# episodes from one task and the history loader places one episode on each GPU
+# through the batch axis.  fsdp_devices=1 keeps the model replicated, avoiding
+# the expensive long-history FSDP anchor split used by the older recipe.
+_CONFIGS.append(
+    dataclasses.replace(
+        pretrained_history_base,
+        name=ROBOTWIN_FOURTASK_HISTORY_4GPU_CONFIG_NAME,
+        model=robotwin_history_rope_model,
+        data=_robotwin_history_data_config("cover_blocks"),
+        history_data=dataclasses.replace(
+            pretrained_history_base.history_data,
+            tasks=ROBOTWIN_FOURTASK_HISTORY_TASKS,
+            cache_dir=None,
+            source_checkpoint_params=pretrained_pi0_params,
+            max_episode_steps=None,
+            episode_length_bucket_size=128,
+            anchors_per_episode=32,
+            gradient_accumulate_episodes=1,
+        ),
+        freeze_filter=robotwin_history_rope_model.get_freeze_filter(),
+        weight_loader=weight_loaders.PretrainedHistoryCheckpointWeightLoader(pretrained_pi0_params),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+            decay_lr=2.5e-6,
+        ),
+        batch_size=4,
+        num_workers=0,
+        num_train_steps=30_000,
+        fsdp_devices=1,
+    )
+)
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")

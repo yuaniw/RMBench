@@ -75,17 +75,20 @@ def history_grad_step(config: _config.TrainConfig, rng, state: training_utils.Tr
                     config.history_data.strict_past_probability,
                 ),
             )
+            modes = modes.reshape(anchors.shape)
             use_previous, current_image_visible, current_state_visible = history_input_mode_masks(modes)
             history_condition, encoded_sequence = model.encode_single_token_history(
                 visual_features,
                 history_states,
                 history_mask,
                 anchors,
-                use_previous=use_previous[None],
+                use_previous=use_previous,
                 train=True,
             )
+            current_image_visible = current_image_visible.reshape((-1,))
+            current_state_visible = current_state_visible.reshape((-1,))
         else:
-            modes = jnp.zeros(anchors.shape[1:], dtype=jnp.int32)
+            modes = jnp.zeros(anchors.shape, dtype=jnp.int32)
             encoded_sequence = None
             current_image_visible = None
             current_state_visible = None
@@ -110,6 +113,7 @@ def history_grad_step(config: _config.TrainConfig, rng, state: training_utils.Tr
         valid = action_valid_mask.astype(per_action_loss.dtype)
         per_anchor_loss = jnp.sum(per_action_loss * valid, axis=-1) / jnp.sum(valid, axis=-1)
         main_loss = jnp.mean(per_anchor_loss)
+        flat_modes = modes.reshape((-1,))
         history_action_loss = jnp.zeros((), dtype=main_loss.dtype)
         state_action_loss = jnp.zeros((), dtype=main_loss.dtype)
         if single_token_mode:
@@ -134,6 +138,15 @@ def history_grad_step(config: _config.TrainConfig, rng, state: training_utils.Tr
                 "history_condition_norm": jnp.mean(jnp.linalg.norm(history_condition, axis=-1)),
                 "history_scale_abs": jnp.mean(jnp.abs(scale)),
                 "history_shift_abs": jnp.mean(jnp.abs(shift)),
+            }
+        elif model.history_conditioner.config.conditioning_mode == "adaln":
+            diagnostics = model.history_adaln_diagnostics(history_condition)
+            info = {
+                "history_condition_norm": jnp.mean(jnp.linalg.norm(history_condition, axis=-1)),
+                "history_attn_scale_abs": jnp.mean(jnp.abs(diagnostics["attn_scale"])),
+                "history_attn_shift_abs": jnp.mean(jnp.abs(diagnostics["attn_shift"])),
+                "history_mlp_scale_abs": jnp.mean(jnp.abs(diagnostics["mlp_scale"])),
+                "history_mlp_shift_abs": jnp.mean(jnp.abs(diagnostics["mlp_shift"])),
             }
         elif model.history_conditioner.config.conditioning_mode == "prefix_tokens":
             diagnostics = model.history_prefix_diagnostics(history_condition)
@@ -161,15 +174,15 @@ def history_grad_step(config: _config.TrainConfig, rng, state: training_utils.Tr
                 / jnp.sum(adjacent_valid),
                 "history_action_aux_loss": history_action_loss,
                 "state_action_aux_loss": state_action_loss,
-                "full_main_loss": jnp.sum(per_anchor_loss * (modes == 0))
-                / jnp.maximum(jnp.sum(modes == 0), 1),
-                "image_dropout_main_loss": jnp.sum(per_anchor_loss * (modes == 1))
-                / jnp.maximum(jnp.sum(modes == 1), 1),
-                "strict_past_main_loss": jnp.sum(per_anchor_loss * (modes == 2))
-                / jnp.maximum(jnp.sum(modes == 2), 1),
-                "full_fraction": jnp.mean(modes == 0),
-                "image_dropout_fraction": jnp.mean(modes == 1),
-                "strict_past_fraction": jnp.mean(modes == 2),
+                "full_main_loss": jnp.sum(per_anchor_loss * (flat_modes == 0))
+                / jnp.maximum(jnp.sum(flat_modes == 0), 1),
+                "image_dropout_main_loss": jnp.sum(per_anchor_loss * (flat_modes == 1))
+                / jnp.maximum(jnp.sum(flat_modes == 1), 1),
+                "strict_past_main_loss": jnp.sum(per_anchor_loss * (flat_modes == 2))
+                / jnp.maximum(jnp.sum(flat_modes == 2), 1),
+                "full_fraction": jnp.mean(flat_modes == 0),
+                "image_dropout_fraction": jnp.mean(flat_modes == 1),
+                "strict_past_fraction": jnp.mean(flat_modes == 2),
             }
         info["main_flow_loss"] = main_loss
         return loss, info
@@ -213,8 +226,9 @@ def apply_history_grads(config: _config.TrainConfig, state: training_utils.Train
 
 
 def make_history_batch_sharding(mesh: jax.sharding.Mesh, batch):
+    data_axis = sharding.DATA_AXIS if mesh.shape[sharding.FSDP_AXIS] > 1 else sharding.BATCH_AXIS
     anchor_sharding = jax.sharding.NamedSharding(
-        mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS)
+        mesh, jax.sharding.PartitionSpec(data_axis)
     )
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
     observation, actions, action_valid_mask, visual, history_states, history_mask, anchors, history_actions = batch
@@ -237,15 +251,26 @@ def main(config: _config.TrainConfig):
         raise ValueError("train_history.py requires a history_data config.")
     if config.model.history is None:
         raise ValueError("train_history.py requires a history-enabled model.")
-    if config.batch_size != 1:
-        raise ValueError("History training uses one episode per dataloader batch.")
-    if jax.device_count() != config.fsdp_devices:
+    if config.batch_size <= 0:
+        raise ValueError("History training requires a positive episode batch size.")
+    if jax.device_count() % config.fsdp_devices != 0:
         raise ValueError(
-            "History training requires all visible devices to form one FSDP group: "
+            "History training requires the visible device count to be divisible by fsdp_devices: "
             f"got {jax.device_count()} visible devices and fsdp_devices={config.fsdp_devices}."
         )
-    if config.history_data.anchors_per_episode % jax.device_count() != 0:
-        raise ValueError("anchors_per_episode must be divisible by the number of visible devices.")
+    data_parallel_devices = jax.device_count() // config.fsdp_devices
+    global_anchor_count = config.batch_size * config.history_data.anchors_per_episode
+    if global_anchor_count % jax.device_count() != 0:
+        raise ValueError(
+            "The global anchor batch must be divisible by the total device count: "
+            f"batch_size={config.batch_size}, anchors_per_episode={config.history_data.anchors_per_episode}, "
+            f"devices={jax.device_count()}."
+        )
+    if config.batch_size % data_parallel_devices != 0:
+        raise ValueError(
+            "History episode batch_size must be divisible by the data-parallel mesh axis: "
+            f"batch_size={config.batch_size}, data_parallel_devices={data_parallel_devices}."
+        )
     probabilities = (
         config.history_data.full_input_probability,
         config.history_data.image_dropout_probability,
@@ -287,6 +312,8 @@ def main(config: _config.TrainConfig):
         functools.partial(history_grad_step, config),
         in_shardings=(replicated_sharding, state_sharding, batch_sharding),
         out_shardings=(grad_sharding, replicated_sharding),
+        # Give the compiler a stable collective axis name for replicated-model
+        # data parallel execution. The mesh still determines placement.
     )
     apply_fn = jax.jit(
         functools.partial(apply_history_grads, config),
