@@ -5,11 +5,12 @@ import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
 
-HistoryEncoderType = Literal["transformer", "mamba"]
+HistoryEncoderType = Literal["transformer", "mamba", "mamba2"]
 HistoryConditioningMode = Literal["film", "adaln", "prefix_tokens", "single_token"]
 HistoryPositionEncoding = Literal["learned_absolute", "rope"]
 HistoryPositionOverflow = Literal["cycle", "clamp"]
 HistoryRematPolicy = Literal["none", "nothing_saveable"]
+HistoryAnchorVisualMode = Literal["pooled", "raw"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -43,9 +44,19 @@ class HistoryEncoderConfig:
     mamba_dt_max: float = 0.1
     mamba_dt_init_floor: float = 1e-4
     mamba_dt_scale: float = 1.0
+    # Parameters for the Mamba2/SSD history encoder.  They are separate from
+    # the legacy selective-SSM parameters above so old checkpoints/configs are
+    # unchanged.
+    mamba2_state_size: int = 64
+    mamba2_head_dim: int = 64
+    mamba2_chunk_size: int = 64
+    mamba2_conv_kernel: int = 4
+    mamba2_expand: int = 2
     anchor_frame: bool = False
     anchor_only: bool = False
     anchor_num_layers: int = 2
+    anchor_visual_mode: HistoryAnchorVisualMode = "pooled"
+    anchor_raw_tokens: int = 196
 
     @property
     def condition_dim(self) -> int:
@@ -98,6 +109,17 @@ class MambaLayerCache(NamedTuple):
 
 class MambaHistoryCache(NamedTuple):
     layers: tuple[MambaLayerCache, ...]
+    length: jax.Array
+    anchor_tokens: jax.Array | None = None
+
+
+class Mamba2LayerCache(NamedTuple):
+    conv_state: jax.Array
+    ssm_state: jax.Array
+
+
+class Mamba2HistoryCache(NamedTuple):
+    layers: tuple[Mamba2LayerCache, ...]
     length: jax.Array
     anchor_tokens: jax.Array | None = None
 
@@ -284,6 +306,8 @@ _remat_transformer_block = nnx.remat(
 class CausalTransformerHistoryEncoder(nnx.Module):
     def __init__(self, config: HistoryEncoderConfig, *, rngs: nnx.Rngs):
         self.config = config
+        if config.anchor_visual_mode not in ("pooled", "raw"):
+            raise ValueError(f"Unsupported anchor_visual_mode: {config.anchor_visual_mode}")
         if config.position_encoding == "learned_absolute":
             self.position_embedding = nnx.Param(
                 jax.random.normal(
@@ -558,6 +582,167 @@ class SelectiveSSMLayer(nnx.Module):
         return jnp.where(valid[:, None], output, 0), new_cache
 
 
+class Mamba2RMSNorm(nnx.Module):
+    """Small RMSNorm used by the Mamba2 block (kept local for compatibility)."""
+
+    def __init__(self, features: int, *, eps: float = 1e-5, rngs: nnx.Rngs):
+        self.eps = eps
+        self.weight = nnx.Param(jnp.ones((features,), dtype=jnp.float32))
+
+    def __call__(self, x: jax.Array, residual: jax.Array | None = None) -> jax.Array:
+        input_dtype = x.dtype
+        x = x.astype(jnp.float32)
+        if residual is not None:
+            x = x * nnx.silu(residual.astype(jnp.float32))
+        x = x * jax.lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + self.eps)
+        return (x * self.weight.value).astype(input_dtype)
+
+
+class Mamba2Mixer(nnx.Module):
+    """Mamba2 mixer adapted from mamba2-jax for continuous history tokens.
+
+    This intentionally exposes a recurrent single-token path.  It has the
+    same projection/state layout as the upstream block, while avoiding a
+    dependency on the newer JAX/Flax versions required by the PyPI package.
+    """
+
+    def __init__(self, config: HistoryEncoderConfig, *, rngs: nnx.Rngs):
+        self.hidden_size = config.d_model
+        self.intermediate_size = config.d_model * config.mamba2_expand
+        self.state_size = config.mamba2_state_size
+        self.head_dim = config.mamba2_head_dim
+        if config.mamba2_state_size <= 0 or config.mamba2_conv_kernel <= 1:
+            raise ValueError("Mamba2 state size must be positive and conv kernel must exceed one.")
+        if config.mamba2_expand <= 0 or config.mamba2_head_dim <= 0:
+            raise ValueError("Mamba2 expand and head dimension must be positive.")
+        if self.intermediate_size % self.head_dim != 0:
+            raise ValueError("Mamba2 intermediate size must be divisible by mamba2_head_dim.")
+        self.num_heads = self.intermediate_size // self.head_dim
+        self.conv_kernel = config.mamba2_conv_kernel
+        self.conv_dim = self.intermediate_size + 2 * self.state_size
+        self.in_proj = nnx.Linear(
+            self.hidden_size,
+            2 * (self.intermediate_size + self.state_size) + self.num_heads,
+            use_bias=False,
+            rngs=rngs,
+        )
+        self.conv_weight = nnx.Param(
+            jax.random.normal(rngs.params(), (self.conv_kernel, self.conv_dim), dtype=jnp.float32)
+            / jnp.sqrt(self.conv_kernel)
+        )
+        self.conv_bias = nnx.Param(jnp.zeros((self.conv_dim,), dtype=jnp.float32))
+        dt_init = jnp.exp(
+            jax.random.uniform(rngs.params(), (self.num_heads,), minval=jnp.log(0.001), maxval=jnp.log(0.1))
+        )
+        self.dt_bias = nnx.Param(dt_init + jnp.log(-jnp.expm1(-dt_init)))
+        a_init = jax.random.uniform(rngs.params(), (self.num_heads,), minval=1.0, maxval=16.0)
+        self.a_log = nnx.Param(jnp.log(a_init))
+        self.skip = nnx.Param(jnp.ones((self.num_heads,), dtype=jnp.float32))
+        self.inner_norm = Mamba2RMSNorm(self.intermediate_size, rngs=rngs)
+        self.out_proj = nnx.Linear(self.intermediate_size, self.hidden_size, use_bias=False, rngs=rngs)
+
+    def init_cache(self, batch_size: int) -> Mamba2LayerCache:
+        return Mamba2LayerCache(
+            conv_state=jnp.zeros((batch_size, self.conv_dim, self.conv_kernel - 1), dtype=jnp.float32),
+            ssm_state=jnp.zeros((batch_size, self.num_heads, self.head_dim, self.state_size), dtype=jnp.float32),
+        )
+
+    def step(self, hidden: jax.Array, cache: Mamba2LayerCache) -> tuple[jax.Array, Mamba2LayerCache]:
+        projected = self.in_proj(hidden).astype(jnp.float32)
+        z, xbc, dt = jnp.split(
+            projected,
+            [self.intermediate_size, self.intermediate_size + self.intermediate_size + 2 * self.state_size],
+            axis=-1,
+        )
+        history = jnp.transpose(cache.conv_state, (0, 2, 1))
+        window = jnp.concatenate([history, xbc[:, None, :]], axis=1)
+        conv = jnp.sum(window * self.conv_weight.value[None, :, :], axis=1) + self.conv_bias.value
+        new_conv = jnp.transpose(window[:, -(self.conv_kernel - 1):, :], (0, 2, 1))
+        conv = nnx.silu(conv)
+        x, b, c = jnp.split(conv, [self.intermediate_size, self.intermediate_size + self.state_size], axis=-1)
+        x = x.reshape(hidden.shape[0], self.num_heads, self.head_dim)
+        b = jnp.broadcast_to(b[:, None, :], (hidden.shape[0], self.num_heads, self.state_size))
+        c = jnp.broadcast_to(c[:, None, :], (hidden.shape[0], self.num_heads, self.state_size))
+        delta = jax.nn.softplus(dt + self.dt_bias.value)
+        decay = jnp.exp(-jnp.exp(self.a_log.value)[None, :] * delta)
+        new_ssm = (
+            decay[:, :, None, None] * cache.ssm_state
+            + delta[:, :, None, None] * b[:, :, None, :] * x[:, :, :, None]
+        )
+        y = jnp.sum(new_ssm * c[:, :, None, :], axis=-1) + self.skip.value[None, :, None] * x
+        # Mamba2's inner RMSNorm gates the SSM output by the second projected
+        # branch (z).  Keep this branch separate from the residual at block
+        # level, matching the upstream mixer semantics.
+        y = self.inner_norm(y.reshape(hidden.shape[0], self.intermediate_size), residual=z)
+        return self.out_proj(y), Mamba2LayerCache(conv_state=new_conv, ssm_state=new_ssm)
+
+
+class Mamba2Block(nnx.Module):
+    def __init__(self, config: HistoryEncoderConfig, *, rngs: nnx.Rngs):
+        self.norm = Mamba2RMSNorm(config.d_model, rngs=rngs)
+        self.mixer = Mamba2Mixer(config, rngs=rngs)
+
+    def init_cache(self, batch_size: int) -> Mamba2LayerCache:
+        return self.mixer.init_cache(batch_size)
+
+    def step(self, token: jax.Array, valid: jax.Array, cache: Mamba2LayerCache) -> tuple[jax.Array, Mamba2LayerCache]:
+        residual = token
+        update, candidate = self.mixer.step(self.norm(token), cache)
+        output = residual + update
+        keep = valid[:, None]
+        return jnp.where(keep, output, 0), Mamba2LayerCache(
+            conv_state=jnp.where(valid[:, None, None], candidate.conv_state, cache.conv_state),
+            ssm_state=jnp.where(valid[:, None, None, None], candidate.ssm_state, cache.ssm_state),
+        )
+
+
+class Mamba2HistoryEncoder(nnx.Module):
+    def __init__(self, config: HistoryEncoderConfig, *, rngs: nnx.Rngs):
+        self.config = config
+        self.blocks = nnx.Dict(
+            {f"layer_{index}": Mamba2Block(config, rngs=rngs) for index in range(config.num_layers)}
+        )
+        self.final_norm = Mamba2RMSNorm(config.d_model, rngs=rngs)
+
+    def init_cache(self, batch_size: int) -> Mamba2HistoryCache:
+        return Mamba2HistoryCache(
+            layers=tuple(
+                self.blocks[f"layer_{index}"].init_cache(batch_size)
+                for index in range(self.config.num_layers)
+            ),
+            length=jnp.zeros((), dtype=jnp.int32),
+            anchor_tokens=None,
+        )
+
+    def step(self, token: jax.Array, valid: jax.Array, cache: Mamba2HistoryCache):
+        x = token
+        new_layers = []
+        for index, layer_cache in enumerate(cache.layers):
+            block = self.blocks[f"layer_{index}"]
+            x, layer_cache = block.step(x, valid, layer_cache)
+            new_layers.append(layer_cache)
+        x = self.final_norm(x)
+        x = jnp.where(valid[:, None], x, 0)
+        return x, Mamba2HistoryCache(tuple(new_layers), cache.length + 1, cache.anchor_tokens)
+
+    def encode_sequence(self, tokens: jax.Array, valid_mask: jax.Array, *, train: bool = False) -> jax.Array:
+        del train
+        cache = self.init_cache(tokens.shape[0])
+
+        # Keep one call per scan iteration; this preserves cache semantics for
+        # padding and makes the training path identical to streaming eval.
+        def scan_step_once(carry, inputs):
+            output, carry = self.step(inputs[0], inputs[1], carry)
+            return carry, output
+
+        _, outputs = jax.lax.scan(
+            scan_step_once,
+            cache,
+            (jnp.swapaxes(tokens, 0, 1), jnp.swapaxes(valid_mask, 0, 1)),
+        )
+        return jnp.swapaxes(outputs, 0, 1)
+
+
 class RecurrentMambaHistoryEncoder(nnx.Module):
     def __init__(self, config: HistoryEncoderConfig, *, rngs: nnx.Rngs):
         self.config = config
@@ -660,6 +845,11 @@ class HistoryConditioner(nnx.Module):
         if config.anchor_frame and config.anchor_num_layers <= 0:
             raise ValueError("anchor_num_layers must be positive when anchor conditioning is enabled.")
         self.input_adapter = HistoryInputAdapter(config, rngs=rngs)
+        self.anchor_raw_feature_proj = None
+        if config.anchor_frame and config.anchor_visual_mode == "raw":
+            self.anchor_raw_feature_proj = nnx.Linear(
+                config.feature_dim, config.d_model, use_bias=False, rngs=rngs
+            )
         self.anchor_attention = None
         if config.anchor_frame:
             self.anchor_attention = nnx.Dict(
@@ -670,6 +860,8 @@ class HistoryConditioner(nnx.Module):
             self.encoder = CausalTransformerHistoryEncoder(config, rngs=rngs)
         elif config.encoder_type == "mamba":
             self.encoder = RecurrentMambaHistoryEncoder(config, rngs=rngs)
+        elif config.encoder_type == "mamba2":
+            self.encoder = Mamba2HistoryEncoder(config, rngs=rngs)
         else:
             raise ValueError(f"Unsupported history encoder type: {config.encoder_type}")
         self.resampler = None
@@ -677,6 +869,12 @@ class HistoryConditioner(nnx.Module):
         self.action_head = None
         self.state_action_head_norm = None
         self.state_action_head = None
+        self.aux_norm = None
+        self.aux_proj = None
+        self.anchor_aux_norm = None
+        self.anchor_aux_proj = None
+        self.remaining_head = None
+        self.phase_head = None
         if config.conditioning_mode == "prefix_tokens":
             if config.encoder_type != "transformer":
                 raise ValueError("Prefix-token conditioning currently requires the Transformer history encoder.")
@@ -690,6 +888,24 @@ class HistoryConditioner(nnx.Module):
             self.action_head = nnx.Linear(config.d_model, config.action_target_dim, rngs=rngs)
             self.state_action_head_norm = nnx.LayerNorm(config.state_dim, rngs=rngs)
             self.state_action_head = nnx.Linear(config.state_dim, config.action_target_dim, rngs=rngs)
+        elif config.conditioning_mode not in ("film", "adaln"):
+            raise ValueError(f"Unsupported history conditioning mode: {config.conditioning_mode}")
+
+        # These heads are deliberately available for both FiLM and AdaLN.  They
+        # supervise the representation without exposing annotation labels at
+        # inference time and therefore do not change the deployed interface.
+        if config.conditioning_mode in ("film", "adaln"):
+            self.aux_norm = nnx.LayerNorm(config.condition_dim, rngs=rngs)
+            self.aux_proj = nnx.Linear(config.condition_dim, config.condition_dim, rngs=rngs)
+            # Anchor auxiliary heads are only part of the anchor-frame model.
+            # Keeping them out of the regular FiLM/AdaLN tree preserves
+            # compatibility with checkpoints trained before anchor
+            # supervision was added.
+            if config.anchor_frame:
+                self.anchor_aux_norm = nnx.LayerNorm(config.d_model, rngs=rngs)
+                self.anchor_aux_proj = nnx.Linear(config.d_model, config.d_model, rngs=rngs)
+                self.remaining_head = nnx.Linear(config.d_model, 1, rngs=rngs)
+                self.phase_head = nnx.Linear(config.d_model, 3, rngs=rngs)
 
     def encode_sequence(
         self, visual_features: jax.Array, states: jax.Array, valid_mask: jax.Array, *, train: bool = False
@@ -700,16 +916,30 @@ class HistoryConditioner(nnx.Module):
     def init_cache(self, batch_size: int):
         cache = self.encoder.init_cache(batch_size)
         if self.config.anchor_frame:
-            anchor_tokens = jnp.zeros(
-                (batch_size, self.config.spatial_tokens, self.config.d_model), dtype=jnp.float32
-            )
+            token_count = (self.config.anchor_raw_tokens
+                           if self.config.anchor_visual_mode == "raw"
+                           else self.config.spatial_tokens)
+            anchor_tokens = jnp.zeros((batch_size, token_count, self.config.d_model), dtype=jnp.float32)
             cache = cache._replace(anchor_tokens=anchor_tokens)
         return cache
 
-    def _anchor_condition(self, visual_features: jax.Array, anchor_indices: jax.Array) -> jax.Array:
+    def _anchor_condition(
+        self, visual_features: jax.Array, anchor_indices: jax.Array,
+        anchor_visual_features: jax.Array | None = None,
+    ) -> jax.Array:
         projected = self.input_adapter.spatial_pool.project(visual_features)
         batch_size, anchor_count = anchor_indices.shape
-        anchor_tokens = jnp.broadcast_to(projected[:, 0, None], (batch_size, anchor_count, projected.shape[2], projected.shape[3]))
+        if self.config.anchor_visual_mode == "raw":
+            if self.anchor_raw_feature_proj is None or anchor_visual_features is None:
+                raise ValueError("Raw anchor mode requires first-frame raw visual features.")
+            anchor_projected = jnp.tanh(self.anchor_raw_feature_proj(anchor_visual_features))
+            anchor_tokens = jnp.broadcast_to(anchor_projected[:, None],
+                                             (batch_size, anchor_count, *anchor_projected.shape[1:]))
+        else:
+            anchor_tokens = jnp.broadcast_to(
+                projected[:, 0, None],
+                (batch_size, anchor_count, projected.shape[2], projected.shape[3]),
+            )
         current = jax.vmap(lambda values, indices: values[indices])(projected, anchor_indices)
         anchor_tokens = anchor_tokens.reshape((-1, anchor_tokens.shape[-2], anchor_tokens.shape[-1]))
         current = current.reshape((-1, current.shape[-2], current.shape[-1]))
@@ -724,14 +954,24 @@ class HistoryConditioner(nnx.Module):
             raise ValueError("Attention diagnostics require the Transformer history encoder.")
         return self.encoder.attention_diagnostics(cache)
 
-    def step(self, visual_features: jax.Array, states: jax.Array, valid: jax.Array, cache):
+    def step(self, visual_features: jax.Array, states: jax.Array, valid: jax.Array, cache,
+             anchor_visual_features: jax.Array | None = None):
         was_empty = cache.length == 0
         token = self.input_adapter(visual_features, states)
         output, cache = self.encoder.step(token, valid, cache)
         if self.config.anchor_frame:
             projected = self.input_adapter.spatial_pool.project(visual_features)
+            if self.config.anchor_visual_mode == "raw":
+                if self.anchor_raw_feature_proj is None:
+                    raise ValueError("Raw anchor projection is not initialized.")
+                if anchor_visual_features is None:
+                    anchor_projected = jnp.tanh(self.anchor_raw_feature_proj(visual_features))
+                else:
+                    anchor_projected = jnp.tanh(self.anchor_raw_feature_proj(anchor_visual_features))
+            else:
+                anchor_projected = projected
             first_valid = was_empty & valid[:, None, None]
-            anchor_tokens = jnp.where(first_valid, projected, cache.anchor_tokens)
+            anchor_tokens = jnp.where(first_valid, anchor_projected, cache.anchor_tokens)
             cache = cache._replace(anchor_tokens=anchor_tokens)
             weights = jax.nn.softmax(self.input_adapter.spatial_pool.score(projected), axis=-2)
             query = jnp.sum(weights * projected, axis=-2, keepdims=True)
@@ -753,16 +993,17 @@ class HistoryConditioner(nnx.Module):
         states: jax.Array,
         valid_mask: jax.Array,
         anchor_indices: jax.Array,
-        *,
+        *, anchor_visual_features: jax.Array | None = None,
+        return_anchor: bool = False,
         train: bool = False,
     ) -> jax.Array:
         sequence = self.encode_sequence(visual_features, states, valid_mask, train=train)
         if self.config.conditioning_mode in ("film", "adaln", "single_token"):
             conditions = jax.vmap(lambda encoded, indices: encoded[indices])(sequence, anchor_indices)
             if self.config.anchor_frame:
-                anchor = self._anchor_condition(visual_features, anchor_indices)
+                anchor = self._anchor_condition(visual_features, anchor_indices, anchor_visual_features)
                 conditions = anchor if self.config.anchor_only else jnp.concatenate([conditions, anchor], axis=-1)
-            return conditions
+            return (conditions, anchor) if return_anchor and self.config.anchor_frame else conditions
         return self.resampler(sequence, valid_mask, anchor_indices)
 
     def gather_single_token_conditions(
@@ -782,3 +1023,31 @@ class HistoryConditioner(nnx.Module):
         if self.state_action_head is None or self.state_action_head_norm is None:
             raise ValueError("State action prediction requires single-token conditioning.")
         return self.state_action_head(self.state_action_head_norm(states))
+
+    def _auxiliary_hidden(self, condition: jax.Array) -> jax.Array:
+        if self.aux_norm is None or self.aux_proj is None:
+            raise ValueError("History auxiliary heads are not enabled for this conditioning mode.")
+        return nnx.gelu(self.aux_proj(self.aux_norm(condition)))
+
+    def predict_remaining(self, anchor_condition: jax.Array) -> jax.Array:
+        if self.remaining_head is None:
+            raise ValueError("Remaining prediction is not enabled.")
+        return self.remaining_head(self._anchor_auxiliary_hidden(anchor_condition)).squeeze(-1)
+
+    def predict_phase_logits(self, anchor_condition: jax.Array) -> jax.Array:
+        if self.phase_head is None:
+            raise ValueError("Phase prediction is not enabled.")
+        return self.phase_head(self._anchor_auxiliary_hidden(anchor_condition))
+
+    # Compatibility accessors for older analysis scripts.  The training path
+    # intentionally does not use these legacy event/progress objectives.
+    def predict_progress(self, condition: jax.Array) -> jax.Array:
+        return jax.nn.sigmoid(jnp.zeros(condition.shape[:-1], dtype=condition.dtype))
+
+    def predict_event_logits(self, condition: jax.Array) -> jax.Array:
+        return jnp.zeros(condition.shape[:-1], dtype=condition.dtype)
+
+    def _anchor_auxiliary_hidden(self, anchor_condition: jax.Array) -> jax.Array:
+        if self.anchor_aux_norm is None or self.anchor_aux_proj is None:
+            raise ValueError("Anchor auxiliary heads are not enabled.")
+        return nnx.gelu(self.anchor_aux_proj(self.anchor_aux_norm(anchor_condition)))

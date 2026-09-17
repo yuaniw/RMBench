@@ -4,7 +4,10 @@ import logging
 import pathlib
 from typing import Any, Literal
 
+import flax.traverse_util
+import jax
 import jax.numpy as jnp
+import numpy as np
 
 import openpi.models.model as _model
 import openpi.policies.policy as _policy
@@ -27,6 +30,24 @@ class PolicyConfig:
     sample_kwargs: dict[str, Any] | None = None
 
 
+def validate_checkpoint_params(params: dict, checkpoint_dir: pathlib.Path | str) -> None:
+    """Reject non-finite weights before model compilation or simulator actions."""
+    invalid = []
+    for path, value in flax.traverse_util.flatten_dict(params).items():
+        if value is None:
+            continue  # NNX stores optional parameters as None leaves.
+        array = np.asarray(value)
+        if not np.isfinite(array).all():
+            invalid.append("/".join(map(str, path)))
+    if invalid:
+        examples = ", ".join(invalid[:5])
+        raise ValueError(
+            f"Invalid checkpoint {checkpoint_dir}: {len(invalid)} parameter tensors contain NaN/Inf "
+            f"(examples: {examples}). Evaluation cannot use these weights. Check the training loss "
+            "and select a finite checkpoint or retrain; changing Python/GPU/XLA flags cannot repair them."
+        )
+
+
 def create_trained_policy(
     train_config: _config.TrainConfig,
     checkpoint_dir: pathlib.Path | str,
@@ -36,7 +57,7 @@ def create_trained_policy(
     default_prompt: str | None = None,
     norm_stats: dict[str, transforms.NormStats] | None = None,
     asset_id: str | None = None,
-    history_overflow: Literal["error", "hold", "slide"] = "error",
+    history_overflow: Literal["error", "hold", "slide", "grow"] = "error",
 ) -> _policy.Policy:
     """Create a policy from a trained checkpoint.
 
@@ -52,13 +73,18 @@ def create_trained_policy(
             from the checkpoint directory.
         asset_id: Asset directory name inside the checkpoint. Defaults to the training data config's asset id.
         history_overflow: Behavior after a Transformer history cache reaches its trained maximum length. ``slide``
-            keeps the most recent window and supports indefinitely long episodes with bounded memory.
+            keeps the most recent window, while ``grow`` doubles the cache capacity and preserves all prior
+            history for effectively unbounded episodes.
     """
     repack_transforms = repack_transforms or transforms.Group()
     checkpoint_dir = download.maybe_download(str(checkpoint_dir))
 
     logging.info("Loading model...")
-    model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
+    # Validate on the host, before allocating GPU memory or compiling kernels.
+    params = _model.restore_params(checkpoint_dir / "params", restore_type=np.ndarray)
+    validate_checkpoint_params(params, checkpoint_dir)
+    model = train_config.model.load(jax.tree.map(lambda value: jnp.asarray(value, dtype=jnp.bfloat16), params))
+    del params
 
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
     if norm_stats is None:

@@ -105,10 +105,14 @@ class AlohaOutputs(transforms.DataTransformFn):
     # If true, this will convert the joint and gripper values from the standard Aloha space to
     # the space used by the pi internal runtime which was used to train the base model.
     adapt_to_pi: bool = True
+    action_output_dim: int = 14
+
+    def __post_init__(self):
+        if self.action_output_dim <= 0 or (self.adapt_to_pi and self.action_output_dim != 14):
+            raise ValueError("Aloha adaptation requires 14 outputs; native outputs need a positive dimension.")
 
     def __call__(self, data: dict) -> dict:
-        # Only return the first 14 dims.
-        actions = np.asarray(data["actions"][:, :14])
+        actions = np.asarray(data["actions"])[..., : self.action_output_dim]
         return {"actions": _encode_actions(actions, adapt_to_pi=self.adapt_to_pi)}
 
 

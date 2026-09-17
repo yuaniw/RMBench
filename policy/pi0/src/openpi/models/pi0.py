@@ -283,11 +283,13 @@ class Pi0(_model.BaseModel):
                     config.history.d_model, paligemma_config.width, rngs=rngs
                 )
 
-    def encode_history_images(self, images: jax.Array, *, pooled_grid_size: int = 4) -> jax.Array:
+    def encode_history_images(self, images: jax.Array, *, pooled_grid_size: int = 4, raw: bool = False) -> jax.Array:
         image_encoder = self.PaliGemma.img
         if self.history_image_encoder is not None:
             image_encoder = self.history_image_encoder
         image_tokens, _ = image_encoder(images, train=False)
+        if raw:
+            return image_tokens
         source_grid_size = int(image_tokens.shape[1]**0.5)
         if source_grid_size**2 != image_tokens.shape[1]:
             raise ValueError(f"Expected a square image-token grid, got {image_tokens.shape[1]} tokens.")
@@ -307,14 +309,20 @@ class Pi0(_model.BaseModel):
         valid_mask: jax.Array,
         anchor_indices: jax.Array,
         *,
+        anchor_visual_features: jax.Array | None = None,
+        return_anchor: bool = False,
         train: bool = False,
     ) -> jax.Array:
         if self.history_conditioner is None:
             raise ValueError("History conditioning is not enabled for this Pi0 model.")
         conditions = self.history_conditioner.gather_anchor_conditions(
-            visual_features, states, valid_mask, anchor_indices, train=train
+            visual_features, states, valid_mask, anchor_indices,
+            anchor_visual_features=anchor_visual_features, return_anchor=return_anchor, train=train
         )
         if self.history_conditioner.config.conditioning_mode in ("film", "adaln"):
+            if return_anchor:
+                condition, anchor = conditions
+                return condition.reshape((-1, condition.shape[-1])), anchor.reshape((-1, anchor.shape[-1]))
             return conditions.reshape((-1, conditions.shape[-1]))
         if self.history_conditioner.config.conditioning_mode == "single_token":
             return conditions.reshape((-1, 1, conditions.shape[-1]))
@@ -432,7 +440,14 @@ class Pi0(_model.BaseModel):
         observation = _model.preprocess_observation(None, observation, train=False)
         visual_features = self.encode_history_images(observation.images["base_0_rgb"])
         valid = observation.image_masks["base_0_rgb"]
-        condition, cache = self.history_conditioner.step(visual_features, observation.state, valid, cache)
+        raw_anchor = None
+        if self.history_conditioner.config.anchor_visual_mode == "raw":
+            # The policy cache stores projected raw anchor tokens.  The first
+            # valid step initializes them; later steps reuse cache contents.
+            raw_anchor = self.encode_history_images(observation.images["base_0_rgb"], raw=True)
+        condition, cache = self.history_conditioner.step(
+            visual_features, observation.state, valid, cache, anchor_visual_features=raw_anchor
+        )
         if self.history_conditioner.config.conditioning_mode == "single_token":
             condition = condition[:, None, :]
         return condition, cache
