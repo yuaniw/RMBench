@@ -22,6 +22,7 @@ import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 from openpi.shared import franka_memory
+from openpi.shared import franka_press_button
 import openpi.shared.normalize as _normalize
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
@@ -1094,6 +1095,14 @@ def robotwin_history_anchor_adaln_bz64_train_config_name(task: str) -> str:
     )
 
 
+def robotwin_history_anchor_adaln_window32_train_config_name(task: str) -> str:
+    return f"{robotwin_history_anchor_adaln_train_config_name(task)}_window32"
+
+
+def robotwin_history_anchor_adaln_window16_train_config_name(task: str) -> str:
+    return f"{robotwin_history_anchor_adaln_train_config_name(task)}_window16"
+
+
 def robotwin_history_anchor_only_train_config_name(task: str) -> str:
     if task not in ROBOTWIN_HISTORY_TASKS:
         raise ValueError(f"Unsupported RoboTwin history task: {task}")
@@ -1345,6 +1354,18 @@ for robotwin_history_task in ROBOTWIN_HISTORY_TASKS:
             fsdp_devices=1,
         )
     )
+    anchor_adaln_baseline = _CONFIGS[-1]
+    for window_size in (16, 32):
+        _CONFIGS.append(
+            dataclasses.replace(
+                anchor_adaln_baseline,
+                name=f"{anchor_adaln_baseline.name}_window{window_size}",
+                model=dataclasses.replace(
+                    anchor_adaln_baseline.model,
+                    history=dataclasses.replace(anchor_adaln_baseline.model.history, history_window_size=window_size),
+                ),
+            )
+        )
     # Two-layer Anchor-AdaLN variant with 64 sampled anchors per episode.
     # Keep this as a separate checkpoint namespace so the existing bz32 runs
     # can be resumed or evaluated independently.
@@ -1959,6 +1980,50 @@ _CONFIGS.extend([
         policy_metadata={"robot": "franka_left", "camera_setup": "front_only", "action_output_dim": 8,
                          "action_representation": "absolute_joint_targets_and_absolute_gripper",
                          "training_action_representation": "joint_delta_from_chunk_origin", "dataset_fps": franka_memory.FPS},
+    ),
+])
+
+# Native bimanual Franka: [left joints(7), gripper, right joints(7), gripper].
+# Both wrists are current observations; history continues to encode cam_high.
+franka_press_button_data = LeRobotAlohaDataConfig(
+    repo_id=franka_press_button.REPO_ID,
+    assets=AssetsConfig(
+        assets_dir="./assets/pi0_franka_press_button_260917_h50",
+        asset_id=franka_press_button.REPO_ID,
+    ),
+    base_config=DataConfig(local_files_only=True, prompt_from_task=True),
+    adapt_to_pi=False,
+    delta_joint_mask=_transforms.make_bool_mask(7, -1, 7, -1),
+    action_output_dim=16,
+    repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform({
+        "images": {name.rsplit(".", 1)[-1]: name for name in franka_press_button.CAMERAS.values()},
+        "state": "observation.state", "actions": "action", "prompt": "prompt",
+    })]),
+)
+franka_press_button_model = dataclasses.replace(
+    franka_memory_model,
+    history=dataclasses.replace(franka_memory_model.history, action_target_dim=16),
+)
+_CONFIGS.extend([
+    dataclasses.replace(
+        next(c for c in _CONFIGS if c.name == franka_memory.PRECOMPUTE_CONFIG),
+        name=franka_press_button.PRECOMPUTE_CONFIG, data=franka_press_button_data,
+    ),
+    dataclasses.replace(
+        next(c for c in _CONFIGS if c.name == franka_memory.TRAIN_CONFIG),
+        name=franka_press_button.TRAIN_CONFIG, model=franka_press_button_model,
+        data=franka_press_button_data,
+        freeze_filter=franka_press_button_model.get_freeze_filter(),
+        history_data=dataclasses.replace(
+            next(c for c in _CONFIGS if c.name == franka_memory.TRAIN_CONFIG).history_data,
+            cache_dir=f"./history_cache/{franka_press_button.REPO_ID}-pi0-base",
+        ),
+        policy_metadata={
+            "robot": "franka_bimanual", "camera_setup": "front_left_right_wrist",
+            "action_output_dim": 16, "dataset_fps": 15,
+            "action_representation": "absolute_joint_targets_and_absolute_gripper",
+            "training_action_representation": "joint_delta_from_chunk_origin",
+        },
     ),
 ])
 
