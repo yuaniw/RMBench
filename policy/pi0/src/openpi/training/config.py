@@ -2004,26 +2004,70 @@ franka_press_button_model = dataclasses.replace(
     franka_memory_model,
     history=dataclasses.replace(franka_memory_model.history, action_target_dim=16),
 )
+franka_press_button_prompt_data = dataclasses.replace(
+    franka_press_button_data,
+    base_config=DataConfig(local_files_only=True, prompt_from_task=False),
+    default_prompt=franka_press_button.PROMPT,
+)
+_franka_press_button_base = dataclasses.replace(
+    next(c for c in _CONFIGS if c.name == franka_memory.TRAIN_CONFIG),
+    name=franka_press_button.TRAIN_CONFIG, model=franka_press_button_model,
+    data=franka_press_button_data,
+    freeze_filter=franka_press_button_model.get_freeze_filter(),
+    history_data=dataclasses.replace(
+        next(c for c in _CONFIGS if c.name == franka_memory.TRAIN_CONFIG).history_data,
+        cache_dir=f"./history_cache/{franka_press_button.REPO_ID}-pi0-base",
+    ),
+    policy_metadata={
+        "robot": "franka_bimanual", "camera_setup": "front_left_right_wrist",
+        "action_output_dim": 16, "dataset_fps": 15,
+        "action_representation": "absolute_joint_targets_and_absolute_gripper",
+        "training_action_representation": "joint_delta_from_chunk_origin",
+    },
+)
 _CONFIGS.extend([
     dataclasses.replace(
         next(c for c in _CONFIGS if c.name == franka_memory.PRECOMPUTE_CONFIG),
         name=franka_press_button.PRECOMPUTE_CONFIG, data=franka_press_button_data,
     ),
+    _franka_press_button_base,
     dataclasses.replace(
-        next(c for c in _CONFIGS if c.name == franka_memory.TRAIN_CONFIG),
-        name=franka_press_button.TRAIN_CONFIG, model=franka_press_button_model,
-        data=franka_press_button_data,
-        freeze_filter=franka_press_button_model.get_freeze_filter(),
+        _franka_press_button_base,
+        name=franka_press_button.PROMPT_TRAIN_CONFIG,
+        data=franka_press_button_prompt_data,
+        policy_metadata={**_franka_press_button_base.policy_metadata, "prompt": franka_press_button.PROMPT},
+    ),
+])
+
+# Consecutive equal absolute targets collapsed to action events. Timestamps
+# are nominal 5 Hz; source physical timestamps remain in the dataset mapping.
+franka_press_button_dedup_data = dataclasses.replace(
+    franka_press_button_data,
+    repo_id=franka_press_button.DEDUP_REPO_ID,
+    assets=AssetsConfig(
+        assets_dir="./assets/pi0_franka_press_button_260917_dedup_h50",
+        asset_id=franka_press_button.DEDUP_REPO_ID,
+    ),
+)
+_CONFIGS.extend([
+    dataclasses.replace(
+        _franka_press_button_base,
+        name=franka_press_button.DEDUP_TRAIN_CONFIG,
+        data=franka_press_button_dedup_data,
         history_data=dataclasses.replace(
-            next(c for c in _CONFIGS if c.name == franka_memory.TRAIN_CONFIG).history_data,
-            cache_dir=f"./history_cache/{franka_press_button.REPO_ID}-pi0-base",
+            _franka_press_button_base.history_data,
+            cache_dir=f"./history_cache/{franka_press_button.DEDUP_REPO_ID}-pi0-base",
         ),
         policy_metadata={
-            "robot": "franka_bimanual", "camera_setup": "front_left_right_wrist",
-            "action_output_dim": 16, "dataset_fps": 15,
-            "action_representation": "absolute_joint_targets_and_absolute_gripper",
-            "training_action_representation": "joint_delta_from_chunk_origin",
+            **_franka_press_button_base.policy_metadata,
+            "dataset_fps": 5, "time_basis": "reindexed_action_events",
+            "prompt": franka_press_button.PROMPT,
         },
+    ),
+    dataclasses.replace(
+        next(c for c in _CONFIGS if c.name == franka_press_button.PRECOMPUTE_CONFIG),
+        name=franka_press_button.DEDUP_PRECOMPUTE_CONFIG,
+        data=franka_press_button_dedup_data,
     ),
 ])
 
