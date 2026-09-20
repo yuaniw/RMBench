@@ -23,6 +23,7 @@ import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 from openpi.shared import franka_memory
 from openpi.shared import franka_press_button
+from openpi.shared import franka_press_button_0919
 import openpi.shared.normalize as _normalize
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
@@ -2068,6 +2069,42 @@ _CONFIGS.extend([
         next(c for c in _CONFIGS if c.name == franka_press_button.PRECOMPUTE_CONFIG),
         name=franka_press_button.DEDUP_PRECOMPUTE_CONFIG,
         data=franka_press_button_dedup_data,
+    ),
+])
+
+# New single-left-arm demonstrations, with front and left wrist observations.
+# Read the explicit task from the new dataset, never the old memory prompt.
+franka_press_button_0919_data = dataclasses.replace(
+    franka_memory_data,
+    repo_id=franka_press_button_0919.REPO_ID,
+    assets=AssetsConfig(
+        assets_dir="./assets/pi0_franka_left_press_button_260919_h50",
+        asset_id=franka_press_button_0919.REPO_ID,
+    ),
+    default_prompt=franka_press_button_0919.PROMPT,
+)
+_CONFIGS.extend([
+    dataclasses.replace(
+        next(c for c in _CONFIGS if c.name == franka_memory.PRECOMPUTE_CONFIG),
+        name=franka_press_button_0919.PRECOMPUTE_CONFIG,
+        data=franka_press_button_0919_data,
+    ),
+    dataclasses.replace(
+        next(c for c in _CONFIGS if c.name == franka_memory.TRAIN_CONFIG),
+        name=franka_press_button_0919.TRAIN_CONFIG,
+        data=franka_press_button_0919_data,
+        history_data=dataclasses.replace(
+            next(c for c in _CONFIGS if c.name == franka_memory.TRAIN_CONFIG).history_data,
+            cache_dir=f"./history_cache/{franka_press_button_0919.REPO_ID}-pi0-base",
+        ),
+        policy_metadata={
+            "robot": "franka_left", "camera_setup": "front_left_wrist",
+            "action_output_dim": 8, "dataset_fps": franka_press_button_0919.FPS,
+            "time_basis": "source_export_timestamps; physical sampling rate unverified",
+            "action_representation": "absolute_joint_targets_and_absolute_gripper",
+            "training_action_representation": "joint_delta_from_chunk_origin",
+            "prompt": franka_press_button_0919.PROMPT,
+        },
     ),
 ])
 
