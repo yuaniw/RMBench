@@ -5,6 +5,7 @@ from collections.abc import Sequence
 import dataclasses
 import difflib
 import logging
+import os
 import pathlib
 from typing import Any, Protocol, TypeAlias
 
@@ -21,9 +22,12 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
+import openpi.shared.nnx_utils as _nnx_utils
 from openpi.shared import franka_memory
 from openpi.shared import franka_press_button
 from openpi.shared import franka_press_button_0919
+from openpi.shared import franka_putback_block_0922
+from openpi.shared import franka_swap_block_0922
 import openpi.shared.normalize as _normalize
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
@@ -239,7 +243,16 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
             )
 
-        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+        # Norm-stat and frozen-history preprocessing only need resized images and
+        # do not consume prompt tokens.  Allow those offline utilities to avoid
+        # constructing the PaliGemma tokenizer when the GCS asset is unavailable.
+        if os.getenv("OPENPI_DISABLE_TOKENIZER") == "1":
+            model_transforms = _transforms.Group(inputs=[
+                _transforms.InjectDefaultPrompt(self.default_prompt),
+                _transforms.ResizeImages(224, 224),
+            ])
+        else:
+            model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
 
         return dataclasses.replace(
             self.create_base_config(assets_dirs),
@@ -1009,6 +1022,28 @@ ROBOTWIN_HISTORY_TASKS = (
     "cover_blocks",
     "press_button",
 )
+# Additional single-task recipes are kept outside the original nine-task set so
+# the existing all-task checkpoints keep their exact task roster and assets.
+ROBOTWIN_HISTORY_SINGLE_TASKS = (
+    "place_object_basket",
+    "turn_switch",
+    "place_phone_stand",
+    "stamp_seal",
+    "beat_block_hammer",
+    "click_bell",
+    "click_alarmclock",
+    "move_pillbottle_pad",
+    "place_object_scale",
+    "place_dual_shoes",
+    "place_mouse_pad",
+    "blocks_ranking_size",
+    "blocks_ranking_rgb",
+    "place_a2b_right",
+    "place_fan",
+    "stack_blocks_three",
+)
+ROBOTWIN_HISTORY_SUPPORTED_TASKS = ROBOTWIN_HISTORY_TASKS + ROBOTWIN_HISTORY_SINGLE_TASKS
+ROBOTWIN_HISTORY_EXTRA_SINGLE_TASKS = ROBOTWIN_HISTORY_SINGLE_TASKS[1:]
 # Local NVMe mirror of the precomputed history features.  Keeping this path
 # outside the Ceph workspace avoids per-step mmap reads over the shared FS.
 ROBOTWIN_HISTORY_CACHE_DIR = "/data/home/gzy/openpi_history_cache"
@@ -1032,19 +1067,19 @@ ROBOTWIN_HISTORY_ANCHOR_ADALN_BZ64_TASKS = (
 
 
 def robotwin_history_repo_id(task: str) -> str:
-    if task not in ROBOTWIN_HISTORY_TASKS:
+    if task not in ROBOTWIN_HISTORY_SUPPORTED_TASKS:
         raise ValueError(f"Unsupported RoboTwin history task: {task}")
     return f"{task}-demo_clean-50-{ROBOTWIN_HISTORY_ARTIFACT_VERSION}"
 
 
 def robotwin_history_precompute_config_name(task: str) -> str:
-    if task not in ROBOTWIN_HISTORY_TASKS:
+    if task not in ROBOTWIN_HISTORY_SUPPORTED_TASKS:
         raise ValueError(f"Unsupported RoboTwin history task: {task}")
     return f"pi0_base_aloha_robotwin_pretrained_{task}_{ROBOTWIN_HISTORY_ARTIFACT_VERSION}"
 
 
 def robotwin_history_train_config_name(task: str) -> str:
-    if task not in ROBOTWIN_HISTORY_TASKS:
+    if task not in ROBOTWIN_HISTORY_SUPPORTED_TASKS:
         raise ValueError(f"Unsupported RoboTwin history task: {task}")
     return (
         "pi0_base_aloha_robotwin_lora_history_transformer_rope_vlm_lora_30k_1gpu_"
@@ -1052,7 +1087,7 @@ def robotwin_history_train_config_name(task: str) -> str:
     )
 
 def robotwin_history_adaln_train_config_name(task: str) -> str:
-    if task not in ROBOTWIN_HISTORY_TASKS:
+    if task not in ROBOTWIN_HISTORY_SUPPORTED_TASKS:
         raise ValueError(f"Unsupported RoboTwin history task: {task}")
     return (
         "pi0_base_aloha_robotwin_lora_history_transformer_rope_adaln_vlm_lora_30k_1gpu_"
@@ -1068,7 +1103,7 @@ def robotwin_history_aux_adaln_train_config_name(task: str) -> str:
     press-button pilot checkpoint unambiguous while allowing the same recipe
     to be instantiated for another task later.
     """
-    if task not in ROBOTWIN_HISTORY_TASKS:
+    if task not in ROBOTWIN_HISTORY_SUPPORTED_TASKS:
         raise ValueError(f"Unsupported RoboTwin history task: {task}")
     return (
         "pi0_base_aloha_robotwin_lora_history_transformer_rope_adaln_aux_"
@@ -1077,7 +1112,7 @@ def robotwin_history_aux_adaln_train_config_name(task: str) -> str:
 
 
 def robotwin_history_anchor_adaln_train_config_name(task: str) -> str:
-    if task not in ROBOTWIN_HISTORY_TASKS:
+    if task not in ROBOTWIN_HISTORY_SUPPORTED_TASKS:
         raise ValueError(f"Unsupported RoboTwin history task: {task}")
     return (
         "pi0_base_aloha_robotwin_lora_history_transformer_rope_anchor_adaln_vlm_lora_30k_1gpu_"
@@ -1087,7 +1122,7 @@ def robotwin_history_anchor_adaln_train_config_name(task: str) -> str:
 
 def robotwin_history_anchor_adaln_bz64_train_config_name(task: str) -> str:
     """Name for the two-layer Anchor-AdaLN recipe with 64 anchors/episode."""
-    if task not in ROBOTWIN_HISTORY_TASKS:
+    if task not in ROBOTWIN_HISTORY_SUPPORTED_TASKS:
         raise ValueError(f"Unsupported RoboTwin history task: {task}")
     return (
         "pi0_base_aloha_robotwin_lora_history_transformer_rope_anchor_adaln_bz64_"
@@ -1105,7 +1140,7 @@ def robotwin_history_anchor_adaln_window16_train_config_name(task: str) -> str:
 
 
 def robotwin_history_anchor_only_train_config_name(task: str) -> str:
-    if task not in ROBOTWIN_HISTORY_TASKS:
+    if task not in ROBOTWIN_HISTORY_SUPPORTED_TASKS:
         raise ValueError(f"Unsupported RoboTwin history task: {task}")
     return (
         "pi0_base_aloha_robotwin_lora_history_transformer_rope_anchor_only_adaln_vlm_lora_30k_1gpu_"
@@ -1114,7 +1149,7 @@ def robotwin_history_anchor_only_train_config_name(task: str) -> str:
 
 
 def robotwin_history_anchor_adaln_4layer_train_config_name(task: str) -> str:
-    if task not in ROBOTWIN_HISTORY_TASKS:
+    if task not in ROBOTWIN_HISTORY_SUPPORTED_TASKS:
         raise ValueError(f"Unsupported RoboTwin history task: {task}")
     return (
         "pi0_base_aloha_robotwin_lora_history_transformer_rope_anchor_adaln4_"
@@ -1124,7 +1159,7 @@ def robotwin_history_anchor_adaln_4layer_train_config_name(task: str) -> str:
 
 def robotwin_history_anchor_adaln_4layer_30k_train_config_name(task: str) -> str:
     """Name for the four-layer Anchor-AdaLN recipe trained for 30k steps."""
-    if task not in ROBOTWIN_HISTORY_TASKS:
+    if task not in ROBOTWIN_HISTORY_SUPPORTED_TASKS:
         raise ValueError(f"Unsupported RoboTwin history task: {task}")
     return (
         "pi0_base_aloha_robotwin_lora_history_transformer_rope_anchor_adaln4_"
@@ -1134,7 +1169,7 @@ def robotwin_history_anchor_adaln_4layer_30k_train_config_name(task: str) -> str
 
 def robotwin_history_anchor_adaln_4layer_bz64_10k_train_config_name(task: str) -> str:
     """Four-layer Anchor-AdaLN recipe with 64 history anchors per update."""
-    if task not in ROBOTWIN_HISTORY_TASKS:
+    if task not in ROBOTWIN_HISTORY_SUPPORTED_TASKS:
         raise ValueError(f"Unsupported RoboTwin history task: {task}")
     return (
         "pi0_base_aloha_robotwin_lora_history_transformer_rope_anchor_adaln4_bz64_"
@@ -1245,7 +1280,7 @@ robotwin_history_absolute_online_siglip_model = dataclasses.replace(
 
 
 def robotwin_history_absolute_train_config_name(task: str) -> str:
-    if task not in ROBOTWIN_HISTORY_TASKS:
+    if task not in ROBOTWIN_HISTORY_SUPPORTED_TASKS:
         raise ValueError(f"Unsupported RoboTwin history task: {task}")
     return (
         "pi0_base_aloha_robotwin_lora_history_transformer_absolute_vlm_lora_30k_1gpu_"
@@ -1751,6 +1786,102 @@ for robotwin_history_task in ROBOTWIN_HISTORY_TASKS:
             num_workers=0,
             num_train_steps=30_000,
             fsdp_devices=1,
+            )
+        )
+
+# Single-task RoboTwin extension. Keep this outside the original nine-task
+# loop so existing all-task checkpoints remain bound to their original assets.
+place_object_basket_data = _robotwin_history_data_config("place_object_basket")
+place_object_basket_repo_id = robotwin_history_repo_id("place_object_basket")
+_CONFIGS.append(
+    dataclasses.replace(
+        pretrained_history_base,
+        name=robotwin_history_precompute_config_name("place_object_basket"),
+        model=pi0.Pi0Config(max_token_len=64),
+        data=place_object_basket_data,
+        history_data=None,
+        freeze_filter=pi0.Pi0Config(max_token_len=64).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader(pretrained_pi0_params),
+        batch_size=1,
+        num_workers=0,
+        fsdp_devices=1,
+    )
+)
+_CONFIGS.append(
+    dataclasses.replace(
+        pretrained_history_base,
+        name=robotwin_history_anchor_adaln_train_config_name("place_object_basket"),
+        model=robotwin_history_anchor_adaln_model,
+        data=place_object_basket_data,
+        history_data=dataclasses.replace(
+            pretrained_history_base.history_data,
+            cache_dir=f"{ROBOTWIN_HISTORY_CACHE_DIR}/{place_object_basket_repo_id}-pi0-base",
+            source_checkpoint_params=pretrained_pi0_params,
+            max_episode_steps=None,
+            episode_length_bucket_size=128,
+            anchors_per_episode=32,
+            gradient_accumulate_episodes=1,
+        ),
+        freeze_filter=robotwin_history_anchor_adaln_model.get_freeze_filter(),
+        weight_loader=weight_loaders.PretrainedHistoryCheckpointWeightLoader(pretrained_pi0_params),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+            decay_lr=2.5e-6,
+        ),
+        batch_size=1,
+        num_workers=0,
+        num_train_steps=30_000,
+        fsdp_devices=1,
+    )
+)
+
+# Additional RoboTwin tasks requested as independent single-task recipes.
+# Keep each task's data, normalization asset, history cache, and checkpoint
+# namespace separate; every update remains one episode x 32 anchors.
+for _single_task in ROBOTWIN_HISTORY_EXTRA_SINGLE_TASKS:
+    _single_data = _robotwin_history_data_config(_single_task)
+    _single_repo_id = robotwin_history_repo_id(_single_task)
+    _CONFIGS.append(
+        dataclasses.replace(
+            pretrained_history_base,
+            name=robotwin_history_precompute_config_name(_single_task),
+            model=pi0.Pi0Config(max_token_len=64),
+            data=_single_data,
+            history_data=None,
+            freeze_filter=pi0.Pi0Config(max_token_len=64).get_freeze_filter(),
+            weight_loader=weight_loaders.CheckpointWeightLoader(pretrained_pi0_params),
+            batch_size=1,
+            num_workers=0,
+            fsdp_devices=1,
+        )
+    )
+    _CONFIGS.append(
+        dataclasses.replace(
+            pretrained_history_base,
+            name=robotwin_history_anchor_adaln_train_config_name(_single_task),
+            model=robotwin_history_anchor_adaln_model,
+            data=_single_data,
+            history_data=dataclasses.replace(
+                pretrained_history_base.history_data,
+                cache_dir=f"{ROBOTWIN_HISTORY_CACHE_DIR}/{_single_repo_id}-pi0-base",
+                source_checkpoint_params=pretrained_pi0_params,
+                max_episode_steps=None,
+                episode_length_bucket_size=128,
+                anchors_per_episode=32,
+                gradient_accumulate_episodes=1,
+            ),
+            freeze_filter=robotwin_history_anchor_adaln_model.get_freeze_filter(),
+            weight_loader=weight_loaders.PretrainedHistoryCheckpointWeightLoader(pretrained_pi0_params),
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                peak_lr=2.5e-5,
+                decay_steps=30_000,
+                decay_lr=2.5e-6,
+            ),
+            batch_size=1,
+            num_workers=0,
+            num_train_steps=30_000,
+            fsdp_devices=1,
         )
     )
 
@@ -2104,6 +2235,118 @@ _CONFIGS.extend([
             "action_representation": "absolute_joint_targets_and_absolute_gripper",
             "training_action_representation": "joint_delta_from_chunk_origin",
             "prompt": franka_press_button_0919.PROMPT,
+        },
+    ),
+])
+
+# Ordinary current-observation Pi0 baseline, with the same native actions and
+# normalization as the September 19 history experiment. Keep the same LoRA-only
+# trainable backbone subset; SigLIP and the dense/projection weights stay frozen.
+franka_press_button_0919_baseline_model = pi0.Pi0Config(
+    paligemma_variant="gemma_2b_lora",
+    action_expert_variant="gemma_300m_lora",
+    max_token_len=64,
+    action_horizon=franka_press_button_0919.HORIZON,
+)
+_CONFIGS.append(dataclasses.replace(
+    next(c for c in _CONFIGS if c.name == franka_press_button_0919.TRAIN_CONFIG),
+    name=franka_press_button_0919.BASELINE_CONFIG,
+    model=franka_press_button_0919_baseline_model,
+    history_data=None,
+    freeze_filter=nnx.Not(_nnx_utils.PathRegex(".*llm.*lora.*")),
+    weight_loader=weight_loaders.CheckpointWeightLoader(str(pathlib.Path(pretrained_pi0_params).expanduser())),
+    batch_size=32, num_workers=4, fsdp_devices=1,
+    save_interval=500, log_interval=25, ema_decay=None,
+    policy_metadata={
+        **next(c for c in _CONFIGS if c.name == franka_press_button_0919.TRAIN_CONFIG).policy_metadata,
+        "history_enabled": False, "finetuning": "vlm_action_lora_only",
+    },
+))
+
+franka_putback_block_0922_data = dataclasses.replace(
+    franka_memory_data,
+    repo_id=franka_putback_block_0922.REPO_ID,
+    assets=AssetsConfig(
+        assets_dir="./assets/pi0_franka_left_putback_block_260922_h50",
+        asset_id=franka_putback_block_0922.REPO_ID,
+    ),
+    default_prompt=franka_putback_block_0922.PROMPT,
+)
+franka_putback_block_0922_baseline_model = pi0.Pi0Config(
+    paligemma_variant="gemma_2b_lora",
+    action_expert_variant="gemma_300m_lora",
+    max_token_len=64,
+    action_horizon=franka_putback_block_0922.HORIZON,
+)
+franka_swap_block_0922_data = dataclasses.replace(
+    franka_memory_data,
+    repo_id=franka_swap_block_0922.REPO_ID,
+    assets=AssetsConfig(
+        assets_dir="./assets/pi0_franka_left_swap_block_260922_h50",
+        asset_id=franka_swap_block_0922.REPO_ID,
+    ),
+    default_prompt=franka_swap_block_0922.PROMPT,
+)
+_CONFIGS.extend([
+    dataclasses.replace(
+        next(c for c in _CONFIGS if c.name == franka_memory.PRECOMPUTE_CONFIG),
+        name=franka_putback_block_0922.PRECOMPUTE_CONFIG,
+        data=franka_putback_block_0922_data,
+    ),
+    dataclasses.replace(
+        next(c for c in _CONFIGS if c.name == franka_memory.TRAIN_CONFIG),
+        name=franka_putback_block_0922.TRAIN_CONFIG,
+        data=franka_putback_block_0922_data,
+        history_data=dataclasses.replace(
+            next(c for c in _CONFIGS if c.name == franka_memory.TRAIN_CONFIG).history_data,
+            cache_dir=f"./history_cache/{franka_putback_block_0922.REPO_ID}-pi0-base",
+        ),
+        save_interval=500,
+        policy_metadata={
+            "robot": "franka_left", "camera_setup": "front_left_wrist",
+            "action_output_dim": 8, "dataset_fps": franka_putback_block_0922.FPS,
+            "action_representation": "absolute_joint_targets_and_absolute_gripper",
+            "training_action_representation": "joint_delta_from_chunk_origin",
+            "prompt": franka_putback_block_0922.PROMPT,
+        },
+    ),
+    dataclasses.replace(
+        next(c for c in _CONFIGS if c.name == franka_press_button_0919.BASELINE_CONFIG),
+        name=franka_putback_block_0922.BASELINE_CONFIG,
+        model=franka_putback_block_0922_baseline_model,
+        data=franka_putback_block_0922_data,
+        history_data=None,
+        assets_base_dir="./assets",
+        weight_loader=weight_loaders.CheckpointWeightLoader(str(pathlib.Path(pretrained_pi0_params).expanduser())),
+        policy_metadata={
+            "robot": "franka_left", "camera_setup": "front_left_wrist",
+            "action_output_dim": 8, "dataset_fps": franka_putback_block_0922.FPS,
+            "action_representation": "absolute_joint_targets_and_absolute_gripper",
+            "training_action_representation": "joint_delta_from_chunk_origin",
+            "prompt": franka_putback_block_0922.PROMPT,
+            "history_enabled": False, "finetuning": "vlm_action_lora_only",
+        },
+    ),
+    dataclasses.replace(
+        next(c for c in _CONFIGS if c.name == franka_memory.PRECOMPUTE_CONFIG),
+        name=franka_swap_block_0922.PRECOMPUTE_CONFIG,
+        data=franka_swap_block_0922_data,
+    ),
+    dataclasses.replace(
+        next(c for c in _CONFIGS if c.name == franka_memory.TRAIN_CONFIG),
+        name=franka_swap_block_0922.TRAIN_CONFIG,
+        data=franka_swap_block_0922_data,
+        history_data=dataclasses.replace(
+            next(c for c in _CONFIGS if c.name == franka_memory.TRAIN_CONFIG).history_data,
+            cache_dir=f"./history_cache/{franka_swap_block_0922.REPO_ID}-pi0-base",
+        ),
+        save_interval=500,
+        policy_metadata={
+            "robot": "franka_left", "camera_setup": "front_left_wrist",
+            "action_output_dim": 8, "dataset_fps": franka_swap_block_0922.FPS,
+            "action_representation": "absolute_joint_targets_and_absolute_gripper",
+            "training_action_representation": "joint_delta_from_chunk_origin",
+            "prompt": franka_swap_block_0922.PROMPT,
         },
     ),
 ])
