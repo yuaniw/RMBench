@@ -28,6 +28,7 @@ from openpi.shared import franka_press_button
 from openpi.shared import franka_press_button_0919
 from openpi.shared import franka_putback_block_0922
 from openpi.shared import franka_swap_block_0922
+from openpi.shared import franka_putback_block_0923
 import openpi.shared.normalize as _normalize
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
@@ -2287,6 +2288,19 @@ franka_swap_block_0922_data = dataclasses.replace(
     ),
     default_prompt=franka_swap_block_0922.PROMPT,
 )
+franka_putback_block_0923_data = dataclasses.replace(
+    franka_memory_data,
+    repo_id=franka_putback_block_0923.REPO_ID,
+    assets=AssetsConfig(
+        assets_dir="./assets/pi0_franka_right_putback_block_260923_h50",
+        asset_id=franka_putback_block_0923.REPO_ID,
+    ),
+    default_prompt=franka_putback_block_0923.PROMPT,
+    repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform({
+        "images": {name.rsplit(".", 1)[-1]: name for name in franka_putback_block_0923.CAMERAS.values()},
+        "state": "observation.state", "actions": "action", "prompt": "prompt",
+    })]),
+)
 _CONFIGS.extend([
     dataclasses.replace(
         next(c for c in _CONFIGS if c.name == franka_memory.PRECOMPUTE_CONFIG),
@@ -2347,6 +2361,41 @@ _CONFIGS.extend([
             "action_representation": "absolute_joint_targets_and_absolute_gripper",
             "training_action_representation": "joint_delta_from_chunk_origin",
             "prompt": franka_swap_block_0922.PROMPT,
+        },
+    ),
+    dataclasses.replace(
+        next(c for c in _CONFIGS if c.name == franka_memory.PRECOMPUTE_CONFIG),
+        name=franka_putback_block_0923.PRECOMPUTE_CONFIG,
+        data=franka_putback_block_0923_data,
+    ),
+    dataclasses.replace(
+        next(c for c in _CONFIGS if c.name == franka_memory.TRAIN_CONFIG),
+        name=franka_putback_block_0923.TRAIN_CONFIG,
+        data=franka_putback_block_0923_data,
+        history_data=dataclasses.replace(
+            next(c for c in _CONFIGS if c.name == franka_memory.TRAIN_CONFIG).history_data,
+            cache_dir=f"./history_cache/{franka_putback_block_0923.REPO_ID}-pi0-base",
+        ),
+        save_interval=500,
+        policy_metadata={
+            "robot": "franka_right", "camera_setup": "front_right_wrist",
+            "action_output_dim": 8, "dataset_fps": franka_putback_block_0923.FPS,
+            "action_representation": "absolute_joint_targets_and_absolute_gripper",
+            "training_action_representation": "joint_delta_from_chunk_origin",
+            "prompt": franka_putback_block_0923.PROMPT,
+        },
+    ),
+    dataclasses.replace(
+        next(c for c in _CONFIGS if c.name == franka_press_button_0919.BASELINE_CONFIG),
+        name=franka_putback_block_0923.BASELINE_CONFIG,
+        data=franka_putback_block_0923_data,
+        policy_metadata={
+            "robot": "franka_right", "camera_setup": "front_right_wrist",
+            "action_output_dim": 8, "dataset_fps": franka_putback_block_0923.FPS,
+            "action_representation": "absolute_joint_targets_and_absolute_gripper",
+            "training_action_representation": "joint_delta_from_chunk_origin",
+            "prompt": franka_putback_block_0923.PROMPT,
+            "history_enabled": False, "finetuning": "vlm_action_lora_only",
         },
     ),
 ])

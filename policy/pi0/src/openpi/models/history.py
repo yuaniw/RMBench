@@ -27,6 +27,9 @@ class HistoryEncoderConfig:
     num_heads: int = 8
     mlp_dim: int = 2048
     max_length: int = 384
+    # Strict temporal input window, including the current frame. None keeps full history.
+    # The separate first-frame anchor remains global.
+    history_window_size: int | None = None
     dropout_rate: float = 0.0
     position_encoding: HistoryPositionEncoding = "learned_absolute"
     # Behavior for learned absolute positions beyond the learned table. ``cycle``
@@ -57,6 +60,18 @@ class HistoryEncoderConfig:
     anchor_num_layers: int = 2
     anchor_visual_mode: HistoryAnchorVisualMode = "pooled"
     anchor_raw_tokens: int = 196
+
+    def __post_init__(self) -> None:
+        if self.history_window_size is not None:
+            if type(self.history_window_size) is not int or self.history_window_size <= 0:
+                raise ValueError("history_window_size must be a positive integer or None.")
+            if (
+                self.encoder_type != "transformer"
+                or self.position_encoding != "rope"
+                or self.conditioning_mode != "adaln"
+                or self.anchor_only
+            ):
+                raise ValueError("history_window_size requires Transformer/RoPE/AdaLN with anchor_only=False.")
 
     @property
     def condition_dim(self) -> int:
@@ -212,7 +227,7 @@ class TransformerHistoryBlock(nnx.Module):
             raise ValueError("History Transformer checkpointing currently requires dropout_rate=0.0.")
         self.num_heads = config.num_heads
         self.head_dim = config.d_model // config.num_heads
-        self.max_length = config.max_length
+        self.max_length = config.history_window_size or config.max_length
         self.position_encoding = config.position_encoding
         self.rope_theta = config.rope_theta
         self.attn_norm = nnx.LayerNorm(config.d_model, rngs=rngs)
@@ -353,6 +368,8 @@ class CausalTransformerHistoryEncoder(nnx.Module):
 
     def encode_sequence(self, tokens: jax.Array, valid_mask: jax.Array, *, train: bool = False) -> jax.Array:
         length = tokens.shape[1]
+        if self.config.history_window_size is not None and length > self.config.history_window_size:
+            raise ValueError("Sequence exceeds history_window_size; encode independent windows for each anchor.")
         positions = None
         if self.config.position_encoding == "learned_absolute":
             x = tokens + self._position_embeddings(length)[None]
@@ -371,16 +388,17 @@ class CausalTransformerHistoryEncoder(nnx.Module):
         return jnp.where(valid_mask[..., None], x, 0)
 
     def init_cache(self, batch_size: int) -> TransformerHistoryCache:
+        capacity = self.config.history_window_size or self.config.max_length
         return TransformerHistoryCache(
             layers=tuple(
                 self.blocks[f"layer_{index}"].init_cache(batch_size) for index in range(self.config.num_layers)
             ),
             input_tokens=jnp.zeros(
-                (batch_size, self.config.max_length, self.config.d_model), dtype=jnp.float32
+                (batch_size, capacity, self.config.d_model), dtype=jnp.float32
             ),
-            valid_mask=jnp.zeros((batch_size, self.config.max_length), dtype=jnp.bool_),
+            valid_mask=jnp.zeros((batch_size, capacity), dtype=jnp.bool_),
             encoded_outputs=jnp.zeros(
-                (batch_size, self.config.max_length, self.config.d_model), dtype=jnp.float32
+                (batch_size, capacity, self.config.d_model), dtype=jnp.float32
             ),
             length=jnp.zeros((), dtype=jnp.int32),
             anchor_tokens=None,
@@ -419,6 +437,9 @@ class CausalTransformerHistoryEncoder(nnx.Module):
     def step(
         self, token: jax.Array, valid: jax.Array, cache: TransformerHistoryCache
     ) -> tuple[jax.Array, TransformerHistoryCache]:
+        if self.config.history_window_size is not None and cache.input_tokens.shape[1] != self.config.history_window_size:
+            raise ValueError("Strict-window cache capacity must equal history_window_size.")
+
         def append_one(
             current_cache: TransformerHistoryCache, inputs: tuple[jax.Array, jax.Array]
         ) -> tuple[TransformerHistoryCache, jax.Array]:
@@ -997,14 +1018,46 @@ class HistoryConditioner(nnx.Module):
         return_anchor: bool = False,
         train: bool = False,
     ) -> jax.Array:
-        sequence = self.encode_sequence(visual_features, states, valid_mask, train=train)
+        if self.config.history_window_size is not None:
+            conditions = self._gather_window_conditions(
+                visual_features, states, valid_mask, anchor_indices, train=train
+            )
+        else:
+            sequence = self.encode_sequence(visual_features, states, valid_mask, train=train)
+            conditions = None
         if self.config.conditioning_mode in ("film", "adaln", "single_token"):
-            conditions = jax.vmap(lambda encoded, indices: encoded[indices])(sequence, anchor_indices)
+            if conditions is None:
+                conditions = jax.vmap(lambda encoded, indices: encoded[indices])(sequence, anchor_indices)
             if self.config.anchor_frame:
                 anchor = self._anchor_condition(visual_features, anchor_indices, anchor_visual_features)
                 conditions = anchor if self.config.anchor_only else jnp.concatenate([conditions, anchor], axis=-1)
             return (conditions, anchor) if return_anchor and self.config.anchor_frame else conditions
         return self.resampler(sequence, valid_mask, anchor_indices)
+
+    def _gather_window_conditions(
+        self, visual_features: jax.Array, states: jax.Array, valid_mask: jax.Array,
+        anchor_indices: jax.Array, *, train: bool,
+    ) -> jax.Array:
+        window_size = self.config.history_window_size
+        tokens = self.input_adapter(visual_features, states)
+        batch_size, anchor_count = anchor_indices.shape
+        starts = jnp.maximum(anchor_indices - window_size + 1, 0)
+        indices = starts[..., None] + jnp.arange(window_size)
+        safe_indices = jnp.minimum(indices, tokens.shape[1] - 1)
+        windows = jax.vmap(lambda values, selected: values[selected])(tokens, safe_indices)
+        window_mask = jax.vmap(lambda values, selected: values[selected])(valid_mask, safe_indices)
+        window_mask = window_mask & (indices <= anchor_indices[..., None])
+        windows = jnp.where(window_mask[..., None], windows, 0)
+        # Each window starts at RoPE position zero and is right-padded, matching
+        # the streaming cache before it fills and after every sliding rebuild.
+        encoded = self.encoder.encode_sequence(
+            windows.reshape((batch_size * anchor_count, window_size, tokens.shape[-1])),
+            window_mask.reshape((batch_size * anchor_count, window_size)),
+            train=train,
+        )
+        last = (anchor_indices - starts).reshape((-1,))
+        conditions = encoded[jnp.arange(batch_size * anchor_count), last]
+        return conditions.reshape((batch_size, anchor_count, -1))
 
     def gather_single_token_conditions(
         self, encoded_sequence: jax.Array, anchor_indices: jax.Array, use_previous: jax.Array
