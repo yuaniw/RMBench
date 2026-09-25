@@ -29,6 +29,7 @@ from openpi.shared import franka_press_button_0919
 from openpi.shared import franka_putback_block_0922
 from openpi.shared import franka_swap_block_0922
 from openpi.shared import franka_putback_block_0923
+from openpi.shared import franka_swap_block_0924
 import openpi.shared.normalize as _normalize
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
@@ -2301,6 +2302,19 @@ franka_putback_block_0923_data = dataclasses.replace(
         "state": "observation.state", "actions": "action", "prompt": "prompt",
     })]),
 )
+franka_swap_block_0924_data = dataclasses.replace(
+    franka_memory_data,
+    repo_id=franka_swap_block_0924.REPO_ID,
+    assets=AssetsConfig(
+        assets_dir="./assets/pi0_franka_right_swap_block_260924_h50",
+        asset_id=franka_swap_block_0924.REPO_ID,
+    ),
+    default_prompt=franka_swap_block_0924.PROMPT,
+    repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform({
+        "images": {name.rsplit(".", 1)[-1]: name for name in franka_swap_block_0924.CAMERAS.values()},
+        "state": "observation.state", "actions": "action", "prompt": "prompt",
+    })]),
+)
 _CONFIGS.extend([
     dataclasses.replace(
         next(c for c in _CONFIGS if c.name == franka_memory.PRECOMPUTE_CONFIG),
@@ -2398,7 +2412,66 @@ _CONFIGS.extend([
             "history_enabled": False, "finetuning": "vlm_action_lora_only",
         },
     ),
+    dataclasses.replace(
+        next(c for c in _CONFIGS if c.name == franka_memory.PRECOMPUTE_CONFIG),
+        name=franka_swap_block_0924.PRECOMPUTE_CONFIG,
+        data=franka_swap_block_0924_data,
+    ),
+    dataclasses.replace(
+        next(c for c in _CONFIGS if c.name == franka_memory.TRAIN_CONFIG),
+        name=franka_swap_block_0924.TRAIN_CONFIG,
+        data=franka_swap_block_0924_data,
+        history_data=dataclasses.replace(
+            next(c for c in _CONFIGS if c.name == franka_memory.TRAIN_CONFIG).history_data,
+            cache_dir=f"./history_cache/{franka_swap_block_0924.REPO_ID}-pi0-base",
+        ),
+        policy_metadata={
+            "robot": "franka_right", "camera_setup": "front_right_wrist",
+            "action_output_dim": 8, "dataset_fps": franka_swap_block_0924.FPS,
+            "action_representation": "absolute_joint_targets_and_absolute_gripper",
+            "training_action_representation": "joint_delta_from_chunk_origin",
+            "prompt": franka_swap_block_0924.PROMPT,
+        },
+    ),
 ])
+
+_CONFIGS.append(dataclasses.replace(
+    next(c for c in _CONFIGS if c.name == franka_putback_block_0923.BASELINE_CONFIG),
+    name=franka_swap_block_0924.BASELINE_CONFIG,
+    data=franka_swap_block_0924_data,
+    policy_metadata={
+        **next(c for c in _CONFIGS if c.name == franka_swap_block_0924.TRAIN_CONFIG).policy_metadata,
+        "history_enabled": False, "finetuning": "vlm_action_lora_only",
+    },
+))
+
+_full_finetune_model = pi0.Pi0Config(
+    paligemma_variant="gemma_2b",
+    action_expert_variant="gemma_300m",
+    max_token_len=64,
+    action_horizon=50,
+)
+for _full_recipe, _full_data in (
+    (franka_putback_block_0923, franka_putback_block_0923_data),
+    (franka_swap_block_0924, franka_swap_block_0924_data),
+):
+    _CONFIGS.append(dataclasses.replace(
+        next(c for c in _CONFIGS if c.name == franka_putback_block_0923.BASELINE_CONFIG),
+        name=_full_recipe.FULL_CONFIG,
+        model=_full_finetune_model,
+        data=_full_data,
+        history_data=None,
+        freeze_filter=nnx.Nothing,
+        weight_loader=weight_loaders.CheckpointWeightLoader(str(pathlib.Path(pretrained_pi0_params).expanduser())),
+        policy_metadata={
+            "robot": "franka_right", "camera_setup": "front_right_wrist",
+            "action_output_dim": 8, "dataset_fps": _full_recipe.FPS,
+            "action_representation": "absolute_joint_targets_and_absolute_gripper",
+            "training_action_representation": "joint_delta_from_chunk_origin",
+            "prompt": _full_recipe.PROMPT,
+            "history_enabled": False, "finetuning": "full_model",
+        },
+    ))
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")
